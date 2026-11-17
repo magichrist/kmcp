@@ -15,9 +15,26 @@ from starlette.responses import JSONResponse
 
 from kmcp.config import config
 from kmcp.db import manager as db_manager
-from kmcp.studio import service_agents, service_connections, service_mcp_connections
+from kmcp.studio import service_agents, service_connections, service_mcp_connections, service_tools
 
 logger = logging.getLogger("kmcp.studio.api")
+
+#: Runtime debug flag toggled from the Studio settings page. ``config`` is a
+#: frozen dataclass, so the live value is kept here and reflected by
+#: ``GET /api/server`` so the UI always shows the truth.
+_debug_runtime: dict[str, bool] = {"debug": bool(getattr(config, "debug", False))}
+
+
+def _server_health() -> dict | None:
+    """Best-effort live server health (uptime, active executions, …)."""
+    try:
+        from kmcp.server import health  # deferred: avoids import cycles
+    except Exception:
+        return None
+    try:
+        return health.get_status()
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -420,21 +437,51 @@ async def server_info(request: Request) -> JSONResponse:
 
     db_path = Path(config.db_path)
     db_exists = db_path.exists()
+    info = {
+        "db_path": str(db_path),
+        "db_exists": db_exists,
+        "server_name": getattr(config, "server_name", "kmcp"),
+        "server_version": getattr(config, "server_version", "2.0.0"),
+        "host": getattr(config, "host", "127.0.0.1"),
+        "port": getattr(config, "port", 8399),
+        "transport": getattr(config, "transport", "streamable-http"),
+        "auth_enabled": bool(getattr(config, "mcp_api_token", None))
+        and not getattr(config, "kmcp_insecure", False),
+        "default_timeout": getattr(config, "default_timeout", 300),
+        "max_timeout": getattr(config, "max_timeout", 600),
+        "max_concurrent": getattr(config, "max_concurrent", 10),
+        "debug": _debug_runtime["debug"],
+    }
+    health = _server_health()
+    if health:
+        for key in ("uptime_seconds", "active_executions", "total_requests", "total_errors", "memory_mb"):
+            if health.get(key) is not None:
+                info[key] = health[key]
+    return JSONResponse(info)
+
+
+async def put_server_debug(request: Request) -> JSONResponse:
+    """Toggle debug mode at runtime. Body: { "debug": <bool> }."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    _debug_runtime["debug"] = bool(body.get("debug", False))
+    return JSONResponse({"debug": _debug_runtime["debug"], "ok": True})
+
+
+async def server_health_api(request: Request) -> JSONResponse:
+    """Server health / uptime for the Overview page."""
+    health = _server_health() or {}
     return JSONResponse(
         {
-            "db_path": str(db_path),
-            "db_exists": db_exists,
-            "server_name": getattr(config, "server_name", "kmcp"),
-            "server_version": getattr(config, "server_version", "2.0.0"),
-            "host": getattr(config, "host", "127.0.0.1"),
-            "port": getattr(config, "port", 8399),
-            "transport": getattr(config, "transport", "streamable-http"),
-            "auth_enabled": bool(getattr(config, "mcp_api_token", None))
-            and not getattr(config, "kmcp_insecure", False),
-            "default_timeout": getattr(config, "default_timeout", 300),
-            "max_timeout": getattr(config, "max_timeout", 600),
-            "max_concurrent": getattr(config, "max_concurrent", 10),
-            "debug": bool(getattr(config, "debug", False)),
+            "status": "ok",
+            "uptime_seconds": health.get("uptime_seconds"),
+            "active_executions": health.get("active_executions"),
+            "total_requests": health.get("total_requests"),
+            "total_errors": health.get("total_errors"),
+            "memory_mb": health.get("memory_mb"),
+            "debug": _debug_runtime["debug"],
         }
     )
 
@@ -511,6 +558,44 @@ async def delete_connection_api(request: Request) -> JSONResponse:
     if not deleted:
         return JSONResponse({"error": "connection not found"}, status_code=404)
     return JSONResponse({"status": "deleted"})
+
+
+async def put_connection_api(request: Request) -> JSONResponse:
+    """Update an existing MCP connection (partial update; omitted fields keep current values)."""
+    db = db_manager.get_db()
+    if db is None:
+        return JSONResponse({"error": "database unavailable"}, status_code=500)
+    connection_id = request.path_params["id"]
+    cur = db.conn.cursor()
+    row = cur.execute("SELECT * FROM mcp_connections WHERE connection_id = ?", (connection_id,)).fetchone()
+    if row is None:
+        return JSONResponse({"error": "connection not found"}, status_code=404)
+    existing = dict(row)
+    for field in ("args", "auth_config"):
+        raw = existing.get(field)
+        if isinstance(raw, str):
+            try:
+                existing[field] = json.loads(raw)
+            except (TypeError, ValueError):
+                pass
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    updated = service_connections.upsert_connection(
+        db,
+        connection_id=connection_id,
+        name=body.get("name", existing.get("name")),
+        transport=body.get("transport", existing.get("transport")),
+        description=body.get("description", existing.get("description")),
+        endpoint_url=body.get("endpoint_url", existing.get("endpoint_url")),
+        command=body.get("command", existing.get("command")),
+        args=body.get("args", existing.get("args")),
+        auth_type=body.get("auth_type", existing.get("auth_type")),
+        auth_config=body.get("auth_config", existing.get("auth_config")),
+        enabled=body.get("enabled", bool(existing.get("enabled", 1))),
+    )
+    return JSONResponse(updated)
 
 
 async def test_connection_api(request: Request) -> JSONResponse:
@@ -677,6 +762,12 @@ async def list_tools_api(request: Request) -> JSONResponse:
     )
     tools = []
     for r in rows[:limit]:
+        schema = r["input_schema"]
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except (TypeError, ValueError):
+                schema = {}
         tools.append(
             {
                 "tool_id": r["tool_id"],
@@ -685,34 +776,58 @@ async def list_tools_api(request: Request) -> JSONResponse:
                 "provider": r["provider"],
                 "visibility": r["visibility"],
                 "enabled": bool(r["enabled"]),
-                "input_schema": r["input_schema"],
+                "input_schema": schema,
                 "default_timeout": r.get("default_timeout"),
+                "alias_for": r.get("alias_for"),
             }
         )
     return JSONResponse({"tools": tools, "count": len(tools)})
 
 
 async def set_tool_visibility_api(request: Request) -> JSONResponse:
+    """Set a tool's visibility mode in the DB and sync the runtime registry."""
     db = db_manager.get_db()
     if db is None:
         return JSONResponse({"error": "database unavailable"}, status_code=500)
     tool_id = request.path_params["id"]
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
     visibility = body.get("visibility")
-    if not visibility:
-        return JSONResponse({"error": "visibility required"}, status_code=400)
-    db.upsert_tool_definition(
-        tool_id=tool_id,
-        name=tool_id,
-        description=None,
-        provider="native",
-        visibility=visibility,
-        enabled=True,
-    )
+    try:
+        ok = service_tools.set_tool_visibility(db, tool_id, visibility)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if not ok:
+        return JSONResponse({"error": "tool not found"}, status_code=404)
+    return JSONResponse({"tool_id": tool_id, "visibility": visibility})
+
+
+async def run_tool_api(request: Request) -> JSONResponse:
+    """Run a single registered tool once via its ``safe_execute`` wrapper.
+
+    Used by the Studio "Test tool" action. Resolves aliases (e.g. ``search``
+    -> ``searchsploit``) before executing.
+    """
+    tool_id = request.path_params["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    args = body.get("args", {})
+    if not isinstance(args, dict):
+        return JSONResponse({"error": "args must be an object"}, status_code=400)
     from kmcp.registry import registry as global_registry
 
-    global_registry.set_visibility(tool_id, visibility)
-    return JSONResponse({"tool_id": tool_id, "visibility": visibility})
+    tool = global_registry.get(tool_id)
+    if tool is None:
+        return JSONResponse({"error": "tool not found"}, status_code=404)
+    try:
+        result = await tool.safe_execute(args)
+    except Exception as exc:  # pragma: no cover - safe_execute catches tool errors
+        return JSONResponse({"error": f"tool run failed: {exc}"}, status_code=500)
+    return JSONResponse({"tool_id": tool_id, "result": result})
 
 
 async def findings_api(request: Request) -> JSONResponse:
@@ -733,6 +848,37 @@ async def findings_api(request: Request) -> JSONResponse:
         offset=offset,
     )
     return JSONResponse(result)
+
+
+async def update_finding_api(request: Request) -> JSONResponse:
+    """Update a finding's status (e.g. open / resolved)."""
+    db = db_manager.get_db()
+    if db is None:
+        return JSONResponse({"error": "database unavailable"}, status_code=500)
+    finding_id = request.path_params["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    status = body.get("status")
+    if not status:
+        return JSONResponse({"error": "status is required"}, status_code=400)
+    ok = db.update_finding_status(int(finding_id), status)
+    if not ok:
+        return JSONResponse({"error": "finding not found"}, status_code=404)
+    return JSONResponse({"status": "updated", "id": finding_id, "finding_status": status})
+
+
+async def delete_finding_api(request: Request) -> JSONResponse:
+    """Delete a finding."""
+    db = db_manager.get_db()
+    if db is None:
+        return JSONResponse({"error": "database unavailable"}, status_code=500)
+    finding_id = request.path_params["id"]
+    ok = db.delete_finding(int(finding_id))
+    if not ok:
+        return JSONResponse({"error": "finding not found"}, status_code=404)
+    return JSONResponse({"status": "deleted", "id": finding_id})
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -809,6 +955,26 @@ async def get_agent_api(request: Request) -> JSONResponse:
     )
 
 
+async def update_agent_api(request: Request) -> JSONResponse:
+    """Update an agent profile's name and/or description (partial update)."""
+    db = db_manager.get_db()
+    if db is None:
+        return JSONResponse({"error": "database unavailable"}, status_code=500)
+    profile_id = request.path_params["id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    name = body.get("name")
+    description = body.get("description")
+    if name is None and description is None:
+        return JSONResponse({"error": "name or description required"}, status_code=400)
+    ok = service_agents.update_profile(db, profile_id, name=name, description=description)
+    if not ok:
+        return JSONResponse({"error": "agent profile not found"}, status_code=404)
+    return JSONResponse(service_agents.get_profile(db, profile_id))
+
+
 async def delete_agent_api(request: Request) -> JSONResponse:
     """Delete an agent profile."""
     db = db_manager.get_db()
@@ -871,6 +1037,7 @@ def mount_studio_routes(app) -> None:
     # Playbook routes
     app.add_route("/api/playbooks", list_playbooks, methods=["GET"])
     app.add_route("/api/playbooks", import_playbook, methods=["POST"])
+    app.add_route("/api/playbooks/import", import_playbook, methods=["POST"])
     app.add_route("/api/playbooks/create", create_playbook_api, methods=["POST"])
     app.add_route("/api/playbooks/seed", seed_playbooks_api, methods=["POST"])
     app.add_route("/api/playbooks/{id}", get_playbook, methods=["GET"])
@@ -886,6 +1053,8 @@ def mount_studio_routes(app) -> None:
 
     # Server info
     app.add_route("/api/server", server_info, methods=["GET"])
+    app.add_route("/api/server/debug", put_server_debug, methods=["PUT"])
+    app.add_route("/api/server/health", server_health_api, methods=["GET"])
 
     # Overview
     app.add_route("/api/overview", overview_api, methods=["GET"])
@@ -894,6 +1063,7 @@ def mount_studio_routes(app) -> None:
     app.add_route("/api/connections", list_connections_api, methods=["GET"])
     app.add_route("/api/connections", upsert_connection_api, methods=["POST"])
     app.add_route("/api/connections/{id}", get_connection_api, methods=["GET"])
+    app.add_route("/api/connections/{id}", put_connection_api, methods=["PUT"])
     app.add_route("/api/connections/{id}", delete_connection_api, methods=["DELETE"])
     app.add_route("/api/connections/{id}/test", test_connection_api, methods=["POST"])
     app.add_route("/api/connections/{id}/discover", discover_connection_api, methods=["POST"])
@@ -901,14 +1071,18 @@ def mount_studio_routes(app) -> None:
     # Tool Registry routes
     app.add_route("/api/tools", list_tools_api, methods=["GET"])
     app.add_route("/api/tools/{id}/visibility", set_tool_visibility_api, methods=["PUT"])
+    app.add_route("/api/tools/{id}/run", run_tool_api, methods=["POST"])
 
     # Findings routes
     app.add_route("/api/findings", findings_api, methods=["GET"])
+    app.add_route("/api/findings/{id}", update_finding_api, methods=["PUT"])
+    app.add_route("/api/findings/{id}", delete_finding_api, methods=["DELETE"])
 
     # Agent Profiles routes
     app.add_route("/api/agents", list_agents_api, methods=["GET"])
     app.add_route("/api/agents", create_agent_api, methods=["POST"])
     app.add_route("/api/agents/{id}", get_agent_api, methods=["GET"])
+    app.add_route("/api/agents/{id}", update_agent_api, methods=["PUT"])
     app.add_route("/api/agents/{id}", delete_agent_api, methods=["DELETE"])
     app.add_route("/api/agents/{id}/tools/{tool_id}", grant_agent_tool_api, methods=["PUT"])
     app.add_route("/api/agents/{id}/tools/{tool_id}", revoke_agent_tool_api, methods=["DELETE"])

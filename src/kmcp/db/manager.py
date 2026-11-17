@@ -883,6 +883,28 @@ class DBManager:
             "validation_status": validation_status,
         }
 
+    def update_finding_status(self, finding_id: int, status: str) -> bool:
+        """Update the status of a finding. Returns True if found and updated."""
+        cur = self.conn.cursor()
+        row = cur.execute("SELECT id FROM findings WHERE id = ?", (finding_id,)).fetchone()
+        if not row:
+            return False
+        now = self._now_utc()
+        cur.execute(
+            "UPDATE findings SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now, finding_id),
+        )
+        self.conn.commit()
+        return True
+
+    def delete_finding(self, finding_id: int) -> bool:
+        """Delete a finding. Returns True when a row was removed."""
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM findings WHERE id = ?", (finding_id,))
+        deleted = cur.rowcount > 0
+        self.conn.commit()
+        return deleted
+
     # ── studio helpers: shared JSON serialization ────────────────────────
 
     @staticmethod
@@ -1389,15 +1411,25 @@ class DBManager:
         return dict(row) if row else None
 
     def list_playbooks(self, status: str | None = None) -> list[dict]:
-        """List playbooks, optionally filtered by status, newest first."""
+        """List playbooks, optionally filtered by status, newest first.
+
+        Each row carries ``latest_version`` (the published version number of
+        ``current_version_id``) so the library can show it without an extra
+        request per playbook.
+        """
         cur = self.conn.cursor()
+        base = """
+            SELECT p.*, v.version AS latest_version
+            FROM playbooks p
+            LEFT JOIN playbook_versions v ON v.id = p.current_version_id
+        """
         if status is not None:
             rows = cur.execute(
-                "SELECT * FROM playbooks WHERE status = ? ORDER BY id DESC",
+                base + " WHERE p.status = ? ORDER BY p.id DESC",
                 (status,),
             ).fetchall()
         else:
-            rows = cur.execute("SELECT * FROM playbooks ORDER BY id DESC").fetchall()
+            rows = cur.execute(base + " ORDER BY p.id DESC").fetchall()
         return [dict(r) for r in rows]
 
     def update_playbook(

@@ -13,12 +13,12 @@ function esc(v) {
 }
 
 /* Copy text to clipboard; works in Safari and other browsers. */
-function showCopyToast(msg) {
+function showCopyToast(msg, duration = 900) {
   const toastEl = $("#toast");
   if (toastEl) {
     toastEl.textContent = msg;
     toastEl.classList.add("show");
-    setTimeout(() => toastEl.classList.remove("show"), 900);
+    setTimeout(() => toastEl.classList.remove("show"), duration);
   }
 }
 
@@ -41,23 +41,23 @@ function copyText(text) {
     document.body.removeChild(el);
   } catch (err) { ok = false; }
 
-  if (ok) { showCopyToast("copied"); return; }
+  if (ok) { showCopyToast("copied", 1200); return; }
 
   /* Method 2: Clipboard API fallback */
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(t).then(() => showCopyToast("copied"))
-      .catch(() => showCopyToast("copy failed"));
+    navigator.clipboard.writeText(t).then(() => showCopyToast("copied", 1200))
+      .catch(() => showCopyToast("copy failed", 2500));
     return;
   }
 
-  showCopyToast("copy failed");
+  showCopyToast("copy failed", 2500);
 }
 
 /* ── API client ─────────────────────────────────────────────────────── */
 
 function token() { return localStorage.getItem(TOKEN_KEY) || ""; }
 
-function toast(msg, bad = false) {
+function toast(msg, bad = false, duration = bad ? 4500 : 2600) {
   const el = $("#toast");
   if (!el) return;
   el.textContent = msg;
@@ -69,7 +69,21 @@ function toast(msg, bad = false) {
     el.classList.remove("show");
     el.style.borderColor = "";
     el.style.background = "";
-  }, 2600);
+  }, duration);
+}
+
+/* Busy state for buttons during async actions: disabled + trailing "…".
+ * Remembers the original label on the first busy call so it can be restored. */
+function busyBtn(btn, busy) {
+  if (!btn) return;
+  if (busy) {
+    if (!btn.dataset.btnBase) btn.dataset.btnBase = btn.textContent.replace(/\s*…\s*$/, "").trim();
+    btn.disabled = true;
+    btn.textContent = btn.dataset.btnBase + "…";
+  } else {
+    btn.disabled = false;
+    btn.textContent = btn.dataset.btnBase || btn.textContent.replace(/\s*…\s*$/, "").trim();
+  }
 }
 
 async function api(path, opts = {}) {
@@ -211,16 +225,96 @@ function kpiBadges(obj) {
   return `<span class="kpi-sub-badges">${chips}</span>`;
 }
 
-function table(headers, rows, emptyText = "Nothing here yet.") {
-  if (!rows.length) return `<div class="panel table-panel"><p class="empty">${esc(emptyText)}</p></div>`;
-  const cols = headers.length;
+function table(headers, rows, opts = {}) {
+  /* opts may be a string (legacy emptyText) or { emptyText, emptyLabel, sortable, sortState }.
+   * emptyLabel: when the list is empty, render an action button (wired by the caller via wireRetry).
+   * sortable: array of column indexes that render as clickable sort headers.
+   * sortState: { col, dir } used to show the active sort direction indicator. */
+  let emptyText = "Nothing here yet.";
+  let emptyLabel = null;
+  let sortable = [];
+  let sortState = null;
+  let selectable = false;
+  if (typeof opts === "string") emptyText = opts;
+  else {
+    emptyText = opts.emptyText ?? "Nothing here yet.";
+    emptyLabel = opts.emptyLabel ?? null;
+    sortable = opts.sortable || [];
+    sortState = opts.sortState;
+    selectable = !!opts.selectable;
+  }
+  const selCols = selectable ? 1 : 0;
+  const totalCols = headers.length + selCols;
+  if (!rows.length) {
+    const act = emptyLabel ? `<div style="margin-top:12px"><button class="btn primary" data-retry>${esc(emptyLabel)}</button></div>` : "";
+    return `<div class="panel table-panel"><p class="empty">${esc(emptyText)}</p>${act}</div>`;
+  }
   return `<div class="panel table-panel" style="overflow:auto">
-    <div class="table-head" style="grid-template-columns:repeat(${cols},minmax(0,1fr)) auto">
-      ${headers.map((h) => `<span>${esc(h)}</span>`).join("")}<span></span>
+    <div class="table-head" style="grid-template-columns:repeat(${totalCols},minmax(0,1fr)) auto">
+      ${selectable ? `<span><input type="checkbox" class="sel-all" id="selAll" title="Select all"></span>` : ""}
+      ${headers.map((h, i) => {
+        const canSort = sortable.includes(i);
+        const active = sortState && sortState.col === i;
+        const dir = active ? (sortState.dir === "asc" ? "↑" : "↓") : "";
+        return canSort
+          ? `<button class="sort-header" type="button" data-sort="${i}" title="Sort by ${esc(h)}">${esc(h)} <span class="sort-dir" aria-hidden="true">${dir}</span></button>`
+          : `<span>${esc(h)}</span>`;
+      }).join("")}<span></span>
     </div>
-    ${rows.map((r) => `<div class="table-row" style="grid-template-columns:repeat(${cols},minmax(0,1fr)) auto">
+    ${rows.map((r) => `<div class="table-row" style="grid-template-columns:repeat(${totalCols},minmax(0,1fr)) auto">
+      ${selectable ? `<input type="checkbox" class="sel-row" data-fid="${esc(String(r.id ?? ""))}">` : ""}
       ${r.cells.map((c) => `<span>${c}</span>`).join("")}<span>${r.menu || ""}</span>
     </div>`).join("")}
+  </div>`;
+}
+
+/* Attach click handlers to every [data-retry] button inside an empty-state panel
+ * (rendered by table() or emptyStatePanel()). scope defaults to document. */
+function wireRetry(scope, fn) {
+  const root = scope || document;
+  $$("[data-retry]", root).forEach((b) => b.addEventListener("click", fn));
+}
+
+/* Helpful empty-state panel with a retry button, shown when a list API call
+   fails or returns no rows (instead of leaving "Loading…" on screen forever). */
+function emptyStatePanel(title, message, retryLabel = "Retry") {
+  return `<div class="panel table-panel">
+    <div class="empty-state">
+      <p class="empty-title">${esc(title)}</p>
+      <p class="empty-msg">${esc(message)}</p>
+      <button class="btn primary" data-retry>${esc(retryLabel)}</button>
+    </div>
+  </div>`;
+}
+
+/* Attach prev/page-size/next wiring to a pagination bar rendered by paginationHtml(). */
+function wirePagination(pg, { onPrev, onNext, onSize }) {
+  pg.querySelector("[data-act=prev]")?.addEventListener("click", onPrev);
+  pg.querySelector("[data-act=next]")?.addEventListener("click", onNext);
+  pg.querySelector("#pageSize")?.addEventListener("change", (e) => onSize(e.target.value));
+}
+
+/* Attach click handlers to sortable table headers. */
+function wireSortHeaders(el, onSort) {
+  $$("[data-sort]", el).forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      onSort(Number(btn.dataset.sort));
+    });
+  });
+}
+
+/* Render prev/next, page size selector and page indicator. total may be null
+   when the backend does not report a count (then "of N" is omitted). */
+function paginationHtml({ page, pageSize, total, hasPrev, hasNext, from, to }) {
+  const totalPages = total != null ? Math.max(1, Math.ceil(total / pageSize)) : 0;
+  return `<div class="pagination" style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin:6px 0 8px;font-size:13px;color:var(--muted)">
+    <div style="display:flex;align-items:center;gap:8px">
+      <button class="btn" data-act="prev" ${!hasPrev ? "disabled" : ""}>‹ Prev</button>
+      <span class="page-indicator">Page <b>${page}</b>${totalPages ? ` of <b>${totalPages}</b>` : ""} · showing <b>${from}</b>–<b>${to}</b>${total != null ? ` of <b>${total}</b>` : ""}</span>
+      <select class="select" id="pageSize">${[10, 25, 50, 100].map((s) => `<option value="${s}" ${s === pageSize ? "selected" : ""}>${s}</option>`).join("")}</select>
+      <button class="btn" data-act="next" ${!hasNext ? "disabled" : ""}>Next ›</button>
+    </div>
   </div>`;
 }
 
@@ -280,6 +374,13 @@ function fmtTs(v) {
   return m ? `${m[1]} ${m[2]}` : String(v).slice(0, 16);
 }
 
+/* Format seconds into a compact uptime string. */
+function fmtUptime(sec) {
+  const s = Math.floor(Number(sec) || 0);
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), r = s % 60;
+  return h ? `${h}h ${m}m ${r}s` : m ? `${m}m ${r}s` : `${r}s`;
+}
+
 const BADGE = (s) => {
   const map = {
     completed: "run-state", running: "run-state run-run", pending: "run-state",
@@ -313,11 +414,17 @@ async function pageOverview() {
       { label: "MCP connections", value: o.connections?.total ?? 0, sub: kpiBadges({ healthy: o.connections?.healthy ?? 0 }) },
       { label: "Agent profiles", value: o.agents?.total ?? 0, sub: "" },
     ])}
+    <div class="quick-actions" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin:10px 0 14px">
+      <button class="btn primary" id="qaNewPlaybook" style="width:100%;padding:14px">＋ New playbook</button>
+      <button class="btn" id="qaRunPlaybook" style="width:100%;padding:14px">▶ Run a playbook</button>
+      <button class="btn" id="qaAddConnection" style="width:100%;padding:14px">🔌 Add connection</button>
+      <button class="btn" id="qaViewFindings" style="width:100%;padding:14px">🔎 View findings</button>
+    </div>
     <div class="two-col">
       <div class="panel" style="min-height:220px">
         <div class="panel-head"><span>Recent executions</span></div>
         <div style="padding:8px">${table(["Execution", "Playbook", "Status", "Completed"],
-          (o.recent_executions || []).map((e) => ({
+          (o.recent_executions || []).slice(0, 5).map((e) => ({
             cells: [esc(e.execution_id), esc(e.playbook_id || "—"), BADGE(e.status), fmtTs(e.completed_at)],
             menu: `<a href="#/executions/${encodeURIComponent(e.execution_id)}">view</a>`,
           })), "No executions yet.")}
@@ -326,13 +433,17 @@ async function pageOverview() {
       <div class="panel" style="min-height:220px">
         <div class="panel-head"><span>Latest findings</span></div>
         <div style="padding:8px">${table(["Target hint", "Tool", "Severity", "Test"],
-          (o.recent_findings || []).map((f) => ({
+          (o.recent_findings || []).slice(0, 5).map((f) => ({
             cells: [esc(f.port_state || f.status || "—"), esc(f.tool), BADGE(f.severity), esc(f.test_name || f.checkname || f.validation_status || "—")],
             menu: `<a href="#/findings">findings</a>`,
           })), "No findings yet.")}
         </div>
       </div>
     </div>`;
+  $("#qaNewPlaybook")?.addEventListener("click", () => { location.hash = "#/playbooks"; });
+  $("#qaRunPlaybook")?.addEventListener("click", () => { location.hash = "#/executions"; });
+  $("#qaAddConnection")?.addEventListener("click", () => { location.hash = "#/connections"; });
+  $("#qaViewFindings")?.addEventListener("click", () => { location.hash = "#/findings"; });
 }
 
 /* ── route: playbook studio (library + editor) ─────────────────────── */
@@ -341,9 +452,15 @@ let selectedId = null;
 let playbooksCache = [];
 
 async function refreshPlaybooks() {
-  const d = await api("/playbooks?limit=200");
-  playbooksCache = d.playbooks || [];
-  if ($("#pbGrid")) renderPlaybookGrid();
+  const el = $("#pbGrid");
+  try {
+    const d = await api("/playbooks?limit=200");
+    playbooksCache = d.playbooks || [];
+    if (el) renderPlaybookGrid();
+  } catch (err) {
+    if (el) el.innerHTML = emptyStatePanel("Failed to load playbooks", err.message, "Retry");
+    el?.querySelector("[data-retry]")?.addEventListener("click", refreshPlaybooks);
+  }
 }
 
 function pbFiltered() {
@@ -381,23 +498,40 @@ function renderPlaybookGrid() {
     return;
   }
   if (!rows.length) {
-    el.innerHTML = `<p class="empty">No playbooks match this filter.</p>`;
+    el.innerHTML = `<p class="empty">No playbooks match this filter.</p>
+      <div style="margin-top:12px"><button class="btn primary" id="pbClearFilters">Clear filters</button></div>`;
+    $("#pbClearFilters")?.addEventListener("click", () => {
+      $("#pbSearch").value = "";
+      $("#pbStatusFilter").value = "";
+      $("#pbCategoryFilter").value = "";
+      $("#pbSort").value = "newest";
+      renderPlaybookGrid();
+    });
     return;
   }
-  el.innerHTML = rows.map((p) => `
-    <a class="pb-card ${p.playbook_id === selectedId ? "active" : ""}" href="#/playbooks/${encodeURIComponent(p.playbook_id)}">
-      <div class="pb-card-top">
-        <span class="pb-card-name">${esc(p.name)}</span>${BADGE(p.status)}
-      </div>
-      <p class="pb-card-desc">${esc(p.description || "No description yet.")}</p>
-      <div class="pb-card-meta">
-        <span class="chip">${esc(p.category || "custom")}</span>
-        <span class="chip mono">${esc(p.playbook_id)}</span>
-        <span class="dim">v ${esc(p.current_version_id || "—")}</span>
-        <span class="dim">${esc((p.created_at || "").slice(0, 10))}</span>
-      </div>
-      <button class="pb-card-delete" title="Delete playbook" data-pid="${esc(p.playbook_id)}">✕</button>
-    </a>`).join("");
+  el.innerHTML = rows.map((p) => {
+    const pid = esc(p.playbook_id);
+    const isDraft = (p.status || "") === "draft";
+    return `
+      <a class="pb-card ${p.playbook_id === selectedId ? "active" : ""}" href="#/playbooks/${encodeURIComponent(p.playbook_id)}">
+        <div class="pb-card-top">
+          <span class="pb-card-name">${esc(p.name)}</span>${BADGE(p.status)}
+        </div>
+        <p class="pb-card-desc">${esc(p.description || "No description yet.")}</p>
+        <div class="pb-card-meta">
+          <span class="chip">${esc(p.category || "custom")}</span>
+          <span class="chip mono">${pid}</span>
+          <span class="dim">v ${esc(p.latest_version || "—")}</span>
+          <span class="dim">${esc((p.created_at || "").slice(0, 10))}</span>
+        </div>
+        <div class="pb-card-foot">
+          <button class="btn ghost pb-card-export" title="Export playbook" data-pid="${pid}">Export</button>
+          <button class="btn ghost pb-card-versions" title="View versions" data-pid="${pid}">Versions</button>
+          ${isDraft ? `<button class="btn pb-card-publish" title="Publish draft" data-pid="${pid}">Publish</button>` : ""}
+        </div>
+        <button class="pb-card-delete" title="Delete playbook" data-pid="${pid}">✕</button>
+      </a>`;
+  }).join("");
 }
 
 async function pagePlaybooks() {
@@ -426,13 +560,27 @@ async function pagePlaybooks() {
   $("#pbNewBtn").addEventListener("click", newPlaybook);
   $("#pbImportBtn").addEventListener("click", importPlaybook);
   $("#pbSeedBtn").addEventListener("click", seedPlaybooks);
-  // delegated delete on playbook cards (grid innerHTML is replaced on each render)
+  // delegated actions on playbook cards (grid innerHTML is replaced on each render)
   $("#pbGrid").addEventListener("click", async (e) => {
-    const btn = e.target.closest(".pb-card-delete");
+    const btn = e.target.closest(".pb-card-delete, .pb-card-export, .pb-card-versions, .pb-card-publish");
     if (!btn) return;
     e.preventDefault();
     e.stopPropagation();
-    await deletePlaybookById(btn.dataset.pid);
+    if (btn.classList.contains("pb-card-delete")) {
+      busyBtn(btn, true);
+      await deletePlaybookById(btn.dataset.pid);
+      busyBtn(btn, false);
+    } else if (btn.classList.contains("pb-card-export")) {
+      busyBtn(btn, true);
+      await exportPlaybookById(btn.dataset.pid);
+      busyBtn(btn, false);
+    } else if (btn.classList.contains("pb-card-versions")) {
+      await viewPlaybookVersions(btn.dataset.pid);
+    } else if (btn.classList.contains("pb-card-publish")) {
+      busyBtn(btn, true);
+      await publishPlaybookById(btn.dataset.pid);
+      busyBtn(btn, false);
+    }
   });
   ["input", "change"].forEach((ev) => {
     $("#pbSearch").addEventListener(ev, renderPlaybookGrid);
@@ -536,6 +684,7 @@ async function pagePlaybookEditor(id) {
           <button class="btn icon" id="zoomOut" title="Zoom out">−</button>
           <button class="btn icon" id="zoomReset" title="Fit to screen">⛶</button>
           <button class="btn icon" id="zoomIn" title="Zoom in">＋</button>
+          <button class="btn icon" id="centerSelBtn" title="Center on selected node">⌂</button>
           <span class="tool-sep"></span>
           <button class="btn icon" id="inspectorToggle" title="Hide/show inspector">◀</button>
           <button class="btn icon" id="delSelBtn" title="Delete selected node">✕</button>
@@ -570,6 +719,10 @@ async function pagePlaybookEditor(id) {
       <div class="dsl-bar">
         <button class="btn icon" id="dslUndo" title="Undo (Ctrl+Z)">↶</button>
         <button class="btn icon" id="dslRedo" title="Redo (Ctrl+Y)">↷</button>
+        <span class="tool-sep"></span>
+        <button class="btn" id="dslSyncToDsl">Sync graph → DSL</button>
+        <button class="btn" id="dslSyncToGraph">Sync DSL → graph</button>
+        <span class="dsl-valid-chip" id="dslValidChip">—</span>
         <span class="dim">Canonical model — the graph above edits this same JSON. Graph ⇄ DSL is always in sync.</span>
       </div>
     </div>
@@ -597,6 +750,9 @@ async function pagePlaybookEditor(id) {
     $("#dslCode").addEventListener("input", onDslInput);
     $("#dslCode").addEventListener("change", onDslInput);
     $("#dslCode").addEventListener("blur", onDslInput);
+    updateDslValidChip();
+    $("#dslUndo").disabled = !dslHistory.length;
+    $("#dslRedo").disabled = !dslFuture.length;
 
     function onDslInput() {
       const text = $("#dslCode").value || "";
@@ -609,6 +765,9 @@ async function pagePlaybookEditor(id) {
         rawDsl = text;
         localStorage.setItem(`kmcp_dsl_${selectedId}`, rawDsl);
       }
+      updateDslValidChip();
+      $("#dslUndo").disabled = !dslHistory.length;
+      $("#dslRedo").disabled = !dslFuture.length;
     }
   } catch (err) {
     $("#pbName").textContent = id;
@@ -624,6 +783,7 @@ async function pagePlaybookEditor(id) {
   $("#addShellBtn").addEventListener("click", () => addShellStep());
   $("#resetLayoutBtn").addEventListener("click", resetGraphLayout);
   $("#zoomIn").addEventListener("click", () => nudgeZoom(+0.2));
+  $("#centerSelBtn").addEventListener("click", centerOnSelection);
   $("#zoomOut").addEventListener("click", () => nudgeZoom(-0.2));
   $("#zoomReset").addEventListener("click", fitToScreen);
 
@@ -655,6 +815,8 @@ async function pagePlaybookEditor(id) {
     rawDsl = dslHistory.pop();
     $("#dslCode").value = rawDsl;
     localStorage.setItem(`kmcp_dsl_${selectedId}`, rawDsl);
+    $("#dslUndo").disabled = !dslHistory.length;
+    $("#dslRedo").disabled = !dslFuture.length;
     toast("Undo");
   });
   $("#dslRedo")?.addEventListener("click", () => {
@@ -663,8 +825,14 @@ async function pagePlaybookEditor(id) {
     rawDsl = dslFuture.pop();
     $("#dslCode").value = rawDsl;
     localStorage.setItem(`kmcp_dsl_${selectedId}`, rawDsl);
+    $("#dslUndo").disabled = !dslHistory.length;
+    $("#dslRedo").disabled = !dslFuture.length;
     toast("Redo");
   });
+
+  /* DSL <-> graph sync buttons */
+  $("#dslSyncToDsl")?.addEventListener("click", syncGraphToDsl);
+  $("#dslSyncToGraph")?.addEventListener("click", syncDslToGraph);
 
 
 
@@ -685,13 +853,13 @@ async function pagePlaybookEditor(id) {
     if (l) l.hidden = !l.hidden;
   });
   $$("#pbMenuList button").forEach((btn) =>
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       $("#pbMenuList").hidden = true;
       const act = btn.dataset.mact;
       if (act === "versions") showVersions();
       else if (act === "export") exportPlaybook();
       else if (act === "import") importPlaybook();
-      else if (act === "delete") deletePlaybook();
+      else if (act === "delete") { busyBtn(btn, true); await deletePlaybook(); busyBtn(btn, false); }
     }));
   document.addEventListener("click", pbCloseMenuOnOutside);
 
@@ -764,6 +932,7 @@ function initCanvasGestures() {
         e.target.closest(".node, .port, .canvas-empty button")) return;
     const sx = e.clientX, sy = e.clientY, ox = graphPan.x, oy = graphPan.y;
     let moved = false;
+    canvasJustPanned = false;
     document.body.classList.add("canvas-panning");
     const move = (ev) => {
       const dx = ev.clientX - sx, dy = ev.clientY - sy;
@@ -774,12 +943,25 @@ function initCanvasGestures() {
     };
     const up = () => {
       document.body.classList.remove("canvas-panning");
+      canvasJustPanned = moved;
       document.removeEventListener("mousemove", move);
       document.removeEventListener("mouseup", up);
     };
     document.addEventListener("mousemove", move);
     document.addEventListener("mouseup", up);
     e.preventDefault();
+  });
+
+  /* Clicking empty canvas deselects the selected node (a pan drag doesn't count). */
+  area.addEventListener("click", (e) => {
+    if (canvasJustPanned) { canvasJustPanned = false; return; }
+    if (e.target.closest(".node, .port, .canvas-empty button")) return;
+    if (graphSel === null) return;
+    graphSel = null;
+    const inner = $("#canvasInner");
+    if (inner) $$(".node", inner).forEach((n) => n.classList.remove("selected"));
+    renderInspector();
+    syncToolbarButtons();
   });
 }
 
@@ -826,6 +1008,7 @@ let futureStack = [];
 let dslHistory = [];   // undo stack for DSL edits
 let dslFuture = [];    // redo stack for DSL edits
 let inspectTab = "general";
+let inspTabByNode = new Map();   // node id -> last active inspector tab id
 let runStatus = {};           // {stepId: status} from the latest execution
 let stepResults = {};         // {stepId: {outputs, error, tool_id}} from the latest execution
 let runStatusTimer = null;
@@ -871,6 +1054,44 @@ function captureGraphToDSL() {
   if (builderView !== "graph" || !graphDef) return;
   const t = $("#dslCode");
   if (t) { rawDsl = JSON.stringify(graphDef, null, 2); t.value = rawDsl; }
+}
+
+/* Reveal whether the DSL textarea currently holds parseable JSON. */
+function updateDslValidChip() {
+  const chip = $("#dslValidChip");
+  if (!chip) return;
+  const text = ($("#dslCode")?.value || "").trim();
+  let valid = true;
+  try { JSON.parse(text || "{}"); } catch { valid = false; }
+  chip.textContent = valid ? "valid JSON" : "invalid JSON";
+  chip.className = "dsl-valid-chip" + (valid ? " valid" : " invalid");
+}
+
+/* Write the in-memory graph model to the DSL textarea (force reconciliation). */
+function syncGraphToDsl() {
+  if (builderView === "dsl") { if (!loadGraphFromDSL()) return; }
+  applyTabFields(stepById(graphSel));
+  const t = $("#dslCode");
+  rawDsl = graphDef ? JSON.stringify(graphDef, null, 2) : "";
+  if (t) t.value = rawDsl;
+  localStorage.setItem(`kmcp_dsl_${selectedId}`, rawDsl);
+  updateDslValidChip();
+  toast("Synced graph → DSL");
+}
+
+/* Parse the DSL textarea and switch to the graph view (force reconciliation). */
+function syncDslToGraph() {
+  const t = $("#dslCode");
+  if (!t) return;
+  const text = t.value.trim();
+  try { JSON.parse(text || "{}"); } catch (err) {
+    toast("DSL is not valid JSON — fix it before syncing to graph: " + err.message, true);
+    return;
+  }
+  rawDsl = text;
+  localStorage.setItem(`kmcp_dsl_${selectedId}`, rawDsl);
+  switchBuilderView("graph");
+  toast("Synced DSL → graph");
 }
 
 function switchBuilderView(view) {
@@ -1005,6 +1226,28 @@ function fitToScreen() {
     y: Math.round((h - (maxY - minY) * graphZoom) / 2 - minY * graphZoom + pad),
   };
   applyZoom();
+}
+
+/* Pan (and lightly zoom) the canvas so the selected node sits center screen. */
+function centerOnSelection() {
+  if (!graphSel) { toast("Select a node first"); return; }
+  const depths = {};
+  graphLayout(depths);
+  const p = nodePos(graphSel, depths);
+  const area = $("#canvasArea");
+  if (!area) return;
+  const rect = area.getBoundingClientRect();
+  const cx = rect.width / 2, cy = rect.height / 2;
+  const nx = p.x + NODE_W / 2, ny = p.y + NODE_H / 2;
+  /* nudge zoom toward 1 so a distant node becomes comfortably viewable */
+  const targetZoom = Math.min(graphZoom, 1);
+  graphZoom = Math.round(Math.min(1.25, Math.max(0.4, targetZoom)) * 100) / 100;
+  graphPan = {
+    x: Math.round(cx - nx * graphZoom),
+    y: Math.round(cy - ny * graphZoom),
+  };
+  applyZoom();
+  toast(`Centered on ${esc(graphSel)}`);
 }
 
 function resetGraphLayout() { pushHistory(); graphPos = {}; graphZoom = 1; graphPan = { x: 0, y: 0 }; renderBuilder(); toast("Layout reset"); }
@@ -1159,10 +1402,7 @@ function renderNodeOutput(res) {
   // toolbar state
   const cnt = $("#graphCount");
   if (cnt) cnt.textContent = `${steps.length} step${steps.length === 1 ? "" : "s"}`;
-  const ub = $("#undoBtn"), rb = $("#redoBtn"), db = $("#delSelBtn");
-  if (ub) ub.disabled = !historyStack.length;
-  if (rb) rb.disabled = !futureStack.length;
-  if (db) db.disabled = !graphSel;
+  syncToolbarButtons();
 
   renderInspector();
   } catch (err) {
@@ -1170,6 +1410,14 @@ function renderNodeOutput(res) {
     if (inner) inner.innerHTML = `<p class="error" style="padding:20px">Render error: ${esc(err.message)}</p>`;
     console.error("renderBuilder failed:", err);
   }
+}
+
+/* Keep the graph undo/redo/delete buttons in sync with the stack/selection. */
+function syncToolbarButtons() {
+  const ub = $("#undoBtn"), rb = $("#redoBtn"), db = $("#delSelBtn");
+  if (ub) ub.disabled = !historyStack.length;
+  if (rb) rb.disabled = !futureStack.length;
+  if (db) db.disabled = !graphSel;
 }
 
 /* ── inspector (tabbed, type-aware) ────────────────────────────────── */
@@ -1480,7 +1728,8 @@ function insTabsHtml(s) {
     <div class="ins-foot">
       <span class="dim" id="insNote"></span>
       <div class="ins-foot-btns">
-        <button class="btn danger" id="insDel">Delete node</button>
+        <button class="btn danger" id="insDel">Delete step</button>
+        <button class="btn" id="insDup">Duplicate step</button>
         <button class="btn primary" id="insApply">Apply</button>
       </div>
     </div>`;
@@ -1498,18 +1747,29 @@ function renderInspector() {
       </div>`;
     return;
   }
+  /* Restore this node's last active inspector tab (per-node persistence). */
+  const savedTab = inspTabByNode.get(graphSel);
+  if (savedTab && INS_TABS.includes(savedTab)) inspectTab = savedTab;
   inj.innerHTML = insTabsHtml(s);
 
   $$("#inspector .ins-tabs button").forEach((btn) =>
     btn.addEventListener("click", () => {
       const s = stepById(graphSel);
-      if (s) applyTabFields(s);   // persist this tab's edits before switching
+      if (s) {
+        applyTabFields(s);   // persist this tab's edits before switching
+        inspTabByNode.set(graphSel, btn.dataset.tab);  // remember per node
+      }
       inspectTab = btn.dataset.tab;
       renderInspector();
     }));
 
   $("#insApply")?.addEventListener("click", () => applyNodeInspector());
-  $("#insDel")?.addEventListener("click", () => deleteGraphStep(graphSel));
+  $("#insDel")?.addEventListener("click", () => {
+    if (!graphSel) return;
+    if (!confirm(`Delete step “${graphSel}” and its edges?`)) return;
+    deleteGraphStep(graphSel);
+  });
+  $("#insDup")?.addEventListener("click", () => { if (graphSel) duplicateStep(graphSel); });
   $("#insClose")?.addEventListener("click", () => $("#insCol")?.classList.remove("ins-open"));
   $("#insAddInput")?.addEventListener("click", () => addMapRow());
 
@@ -1808,9 +2068,25 @@ function deleteGraphStep(id) {
     if (Array.isArray(s.depends_on)) s.depends_on = s.depends_on.filter((d) => d !== id);
   });
   graphSel = null;
+  inspTabByNode.delete(id);
   captureGraphToDSL();
   renderBuilder();
-  toast(`Step ${id} deleted`);
+  toast(`Step ${esc(id)} deleted`);
+}
+
+function duplicateStep(id) {
+  const s = stepById(id);
+  if (!s) return;
+  let finalId = `${id}_copy`;
+  let n = 1;
+  while (stepById(finalId)) finalId = `${id}_copy_${n++}`;
+  pushHistory();
+  const copy = { ...s, id: finalId };
+  getGraphSteps().push(copy);
+  graphSel = finalId;
+  captureGraphToDSL();
+  renderBuilder();
+  toast(`Duplicated ${esc(id)} → ${esc(finalId)}`);
 }
 
 function nextId(prefix) {
@@ -1862,6 +2138,7 @@ function addShellStep() {
 /* ── node dragging ────────────────────────────────────────────────── */
 
 let dragCtx = null;
+let canvasJustPanned = false;   // set true when an empty-canvas pan drag occurred
 function startNodeDrag(e, id, origin) {
   if (e.button !== 0) return;
   /* Prevent text selection immediately on mousedown */
@@ -1897,6 +2174,7 @@ function startNodeDrag(e, id, origin) {
         if (nodeEl) nodeEl.classList.add("selected");
       }
       renderInspector();
+      syncToolbarButtons();
       if (window.matchMedia("(max-width: 1023px)").matches) $("#insCol")?.classList.add("ins-open");
     }
   };
@@ -1935,7 +2213,7 @@ function armConnect(srcId) {
 
 function disarmConnect() {
   pendingConnect = null;
-  $$(".port").forEach((p) => p.classList.remove("armed"));
+  $$(".port").forEach((p) => p.classList.remove("armed", "compatible", "incompatible"));
 }
 
 function completeConnect(srcId, tgtId) {
@@ -1967,6 +2245,19 @@ function startPortConnect(e, srcId) {
   const a = nodePos(srcId, depths);
   const x1 = a.x + NODE_W, y1 = a.y + NODE_H / 2;
   connectCtx = { srcId, depths };
+  /* Dim target ports that would create a cycle or belong to the source node;
+   * glow the compatible input ports as "drop here" targets. */
+  const compatible = new Set(), incompatible = new Set();
+  for (const s of getGraphSteps()) {
+    if (s.id === srcId || wouldCreateCycle(srcId, s.id)) incompatible.add(s.id);
+    else compatible.add(s.id);
+  }
+  $$(".port").forEach((p) => {
+    const node = p.closest(".node");
+    if (!node || !node.dataset.step || !p.classList.contains("left")) return;
+    if (compatible.has(node.dataset.step)) p.classList.add("compatible");
+    else if (incompatible.has(node.dataset.step)) p.classList.add("incompatible");
+  });
   const inner = $("#canvasInner");
   const toCanvas = (ev) => {
     const r = inner.getBoundingClientRect();
@@ -1993,6 +2284,7 @@ function startPortConnect(e, srcId) {
     clearConnectPreview();
     connectCtx = null;
     if (Math.hypot(ev.clientX - startX, ev.clientY - startY) < 4) { disarmConnect(); armConnect(srcId); return; }
+    disarmConnect();
     const hit = document.elementFromPoint(ev.clientX, ev.clientY)?.closest(".node");
     if (!hit) return;
     const tgtId = hit.dataset.step;
@@ -2005,10 +2297,18 @@ function startPortConnect(e, srcId) {
 
 /* Esc cancels an armed click-connect */
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && pendingConnect) {
-    disarmConnect();
-    const col = $("#insCol");
-    if (col) col.classList.remove("ins-open");
+  if (e.key === "Escape") {
+    if (pendingConnect) {
+      disarmConnect();
+      const col = $("#insCol");
+      if (col) col.classList.remove("ins-open");
+    }
+    if (connectCtx) {
+      clearConnectPreview();
+      connectCtx = null;
+      disarmConnect();
+      toast("Connection cancelled");
+    }
   }
   /* Delete / Backspace removes the selected node (when not typing in a field). */
   if ((e.key === "Delete" || e.key === "Backspace") && graphSel) {
@@ -2085,6 +2385,19 @@ function addStage(type) {
 
 /* ── run: input modal built from the playbook's input specs ────────── */
 
+/* Read the last-run record for a playbook from localStorage and render a
+ * small status chip (status + timestamp) for the run modal header. */
+function runLastChipHtml(id) {
+  const raw = localStorage.getItem(`kmcp_run_${id}`);
+  if (!raw) return "";
+  let r;
+  try { r = JSON.parse(raw); } catch { return ""; }
+  const st = String(r.status || "—");
+  const cls = st === "completed" ? "ok" : (st === "failed" || st === "cancelled" ? "failed" : "run-run");
+  const at = r.completedAt || r.startedAt;
+  return `<span class="chip ${cls}">Last run: ${esc(st)}${at ? ` · ${esc(fmtTs(at))}` : ""}</span>`;
+}
+
 async function runModal(id) {
   let def = null;
   try { def = (await api(`/playbooks/${encodeURIComponent(id)}/definition`)).definition; } catch { /* not saved yet */ }
@@ -2103,6 +2416,7 @@ async function runModal(id) {
   const byName = new Map();
   for (const sp of [...stepDerived, ...declared]) byName.set(sp.name, sp); // declared overrides step-derived
   const specs = [...byName.values()];
+  const defaults = new Map(specs.map((sp) => [sp.name, sp.spec?.default]));
   const rows = specs.map((sp) => {
     const type = String(sp.spec?.type || "string");
     const required = sp.spec?.required ? "required" : "optional";
@@ -2110,7 +2424,7 @@ async function runModal(id) {
     if (type === "boolean") {
       field = `<select class="select run-in" data-name="${esc(sp.name)}"><option value="true">true</option><option value="false">false</option></select>`;
     } else if (type === "integer" || type === "number") {
-      field = `<input class="select run-in" data-name="${esc(sp.name)}" type="number" value="${sp.spec?.default ?? ""}">`;
+      field = `<input class="select run-in" data-name="${esc(sp.name)}" type="number" value="${esc(String(sp.spec?.default ?? ""))}">`;
     } else if (type === "array" || type === "object") {
       field = `<textarea class="select area run-in" data-name="${esc(sp.name)}" spellcheck="false" style="min-height:56px;font-family:ui-monospace,Menlo,monospace" placeholder="JSON ${type}">${esc(JSON.stringify(sp.spec?.default ?? (type === "array" ? [] : {})))}</textarea>`;
     } else {
@@ -2128,7 +2442,7 @@ async function runModal(id) {
   const allRefs = collectRunInputs(def);
   const refList = allRefs.map((sp) => {
     const deflt = sp.spec?.default;
-    const hint = deflt === undefined ? "" : ` (default: ${JSON.stringify(deflt)})`;
+    const hint = deflt === undefined ? "" : ` (default: ${esc(JSON.stringify(deflt))})`;
     return `<span class="chip mono">${esc(sp.name)}${hint}</span>`;
   }).join(" ");
   const refHtml = allRefs.length
@@ -2144,6 +2458,7 @@ async function runModal(id) {
   bd.innerHTML = `
     <div class="modal run-modal">
       <h3>Run “${esc(id)}”</h3>
+      ${runLastChipHtml(id)}
       <p class="dim">Runs the published version. This playbook takes ${specs.length} input${specs.length === 1 ? "" : "s"} — anything omitted falls back to its default.</p>
       ${rows || `<p class="dim">No declared inputs — start a run directly, or add extra ones as JSON below.</p>`}
       ${refHtml}
@@ -2159,11 +2474,26 @@ async function runModal(id) {
       </div>
       <div class="modal-actions">
         <button class="btn" id="runCancel">Cancel</button>
+        <button class="btn ghost" id="runReset">Reset to defaults</button>
         <button class="btn primary" id="runStart">▶ Start run</button>
       </div>
     </div>`;
   document.body.appendChild(bd);
   bd.querySelector("#runCancel").addEventListener("click", () => bd.remove());
+  bd.querySelector("#runReset").addEventListener("click", () => {
+    bd.querySelectorAll(".run-in").forEach((f) => {
+      const name = f.dataset.name;
+      const deflt = defaults.get(name);
+      if (f.tagName === "TEXTAREA") {
+        f.value = deflt === undefined || deflt === null ? ""
+          : (typeof deflt === "string" ? deflt : JSON.stringify(deflt));
+      } else {
+        f.value = deflt === undefined || deflt === null ? "" : String(deflt);
+      }
+    });
+    bd.querySelector("#runExtra").value = "{}";
+    toast("Inputs reset to defaults");
+  });
   bd.addEventListener("mousedown", (e) => { if (e.target === bd) bd.remove(); });
   bd.querySelector("#runStart").addEventListener("click", async () => {
     const inputs = {};
@@ -2189,8 +2519,14 @@ async function runModal(id) {
     if (!ok) return;
     Object.assign(inputs, extra || {});
     const debug = bd.querySelector("#runDebug")?.checked === true;
+    const startBtn = bd.querySelector("#runStart");
+    busyBtn(startBtn, true);
     bd.remove();
-    await startRun(id, inputs, { debug, trigger: "studio" });
+    try {
+      await startRun(id, inputs, { debug, trigger: "studio" });
+    } finally {
+      busyBtn(startBtn, false);
+    }
   });
 }
 
@@ -2206,6 +2542,7 @@ async function startRun(id, inputs, opts = {}) {
     const execId = r?.execution?.execution_id || r?.execution_id || "";
     if (!execId) { toast("Run started but no execution id"); return; }
     toast(`Run started: ${execId}`);
+    localStorage.setItem(`kmcp_run_${id}`, JSON.stringify({ status: "running", startedAt: new Date().toISOString(), playbook_id: id }));
     currentExecId = execId;
     $("#pbCancelRun")?.hidden ? $("#pbCancelRun").hidden = false : null;
 
@@ -2236,6 +2573,7 @@ async function startRun(id, inputs, opts = {}) {
           clearInterval(runStatusTimer);
           runStatusTimer = null;
           currentExecId = null;
+          localStorage.setItem(`kmcp_run_${id}`, JSON.stringify({ status: st, completedAt: new Date().toISOString(), playbook_id: id }));
           $("#pbCancelRun")?.hidden ? null : ($("#pbCancelRun").hidden = true);
           renderBuilder();
           toast(st === "completed" ? "Run completed" : `Run ${st}`);
@@ -2252,6 +2590,8 @@ async function startRun(id, inputs, opts = {}) {
 async function cancelCurrentRun() {
   if (!currentExecId) return toast("No run in progress", true);
   if (!confirm(`Cancel run ${currentExecId}?`)) return;
+  const b = $("#pbCancelRun");
+  busyBtn(b, true);
   try {
     await api(`/executions/${encodeURIComponent(currentExecId)}/cancel`, { method: "POST" });
     toast("Cancelling run…");
@@ -2260,6 +2600,7 @@ async function cancelCurrentRun() {
   } catch (err) {
     toast(err.message, true);
   }
+  busyBtn(b, false);
 }
 
 /* surface the latest execution's per-step status on the graph */
@@ -2529,31 +2870,161 @@ async function showVersions() {
 
 async function exportPlaybook() {
   if (!selectedId) return toast("Select a playbook first", true);
+  await exportPlaybookById(selectedId);
+}
+
+async function exportPlaybookById(pid) {
   try {
-    const pkg = await api(`/playbooks/${encodeURIComponent(selectedId)}/export`);
+    const pkg = await api(`/playbooks/${encodeURIComponent(pid)}/export`);
     const blob = new Blob([JSON.stringify(pkg, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = `${selectedId}.json`;
+    a.download = `${pid}.json`;
     a.click();
     URL.revokeObjectURL(a.href);
     toast("Export downloaded");
   } catch (err) { toast(err.message, true); }
 }
 
+/* Publish a draft playbook from the library. Publish is gated on operator
+   approval: on a 403, prompt to create an approval request, then retry. */
+async function publishPlaybookById(pid) {
+  let def;
+  try {
+    const d = await api(`/playbooks/${encodeURIComponent(pid)}/definition`);
+    def = d.definition;
+  } catch (err) {
+    return toast(err.message, true);
+  }
+  if (!def) return toast("No draft definition to publish", true);
+  const version = (def && def.version) || "1.0.0";
+  try {
+    await api(`/playbooks/${encodeURIComponent(pid)}/publish`, {
+      method: "POST", body: JSON.stringify({ definition: def, version }),
+    });
+    toast("Published");
+    await refreshPlaybooks();
+  } catch (err) {
+    if (/approval/i.test(err.message || "")) {
+      if (confirm("Create approval request?")) {
+        try {
+          await api(`/playbooks/${encodeURIComponent(pid)}/approval-request`, { method: "POST" });
+          toast("Approval request recorded — retrying publish");
+          await publishPlaybookById(pid);
+        } catch (e2) { toast(e2.message, true); }
+      }
+      return;
+    }
+    toast(err.message, true);
+  }
+}
+
+/* Open a modal listing a playbook's published versions, each with a rollback
+   action (POST /api/playbooks/{id}/rollback). */
+async function viewPlaybookVersions(pid) {
+  try {
+    const d = await api(`/playbooks/${encodeURIComponent(pid)}/versions`);
+    const list = d.versions || [];
+    if (!list.length) return toast("No versions published yet");
+    const bd = document.createElement("div");
+    bd.className = "modal-backdrop show";
+    bd.innerHTML = `
+      <div class="modal new-pb-modal" role="dialog" aria-modal="true">
+        <h3>Versions of “${esc(pid)}”</h3>
+        <div style="max-height:340px;overflow:auto;margin:10px 0;border:1px solid var(--line2);border-radius:9px;background:var(--panel2)">
+          <table style="width:100%;border-collapse:collapse;font-size:12.5px">
+            <thead><tr>
+              <th style="text-align:left;padding:7px 10px">Version</th>
+              <th style="text-align:left;padding:7px 10px">Published</th>
+              <th style="text-align:right;padding:7px 10px">Action</th>
+            </tr></thead>
+            <tbody>
+              ${list.map((v) => `
+                <tr>
+                  <td style="padding:7px 10px;border-bottom:1px solid var(--line2)">
+                    <span class="mono">v ${esc(v.version)}</span><br/>
+                    <span class="dim" style="font-size:11px">${esc(String(v.version_id || ""))}</span>
+                  </td>
+                  <td style="padding:7px 10px;border-bottom:1px solid var(--line2)">${esc(fmtTs(v.published_at))}</td>
+                  <td style="padding:7px 10px;border-bottom:1px solid var(--line2);text-align:right">
+                    <button class="btn ghost" data-rid="${esc(String(v.version_id))}" data-rver="${esc(v.version)}">Roll back</button>
+                  </td>
+                </tr>`).join("")}
+            </tbody>
+          </table>
+        </div>
+        <div class="modal-actions">
+          <button class="btn" id="verClose">Close</button>
+        </div>
+      </div>`;
+    document.body.appendChild(bd);
+    const close = () => bd.remove();
+    bd.querySelector("#verClose").addEventListener("click", close);
+    bd.addEventListener("mousedown", (e) => { if (e.target === bd) close(); });
+    bd.addEventListener("click", async (e) => {
+      const b = e.target.closest("button[data-rid]");
+      if (!b) return;
+      const rid = b.dataset.rid;
+      if (!confirm(`Roll back “${pid}” to version ${b.dataset.rver}?`)) return;
+      try {
+        await api(`/playbooks/${encodeURIComponent(pid)}/rollback`, {
+          method: "POST", body: JSON.stringify({ version_id: rid }),
+        });
+        toast("Rolled back");
+        close();
+        await refreshPlaybooks();
+      } catch (err) { toast(err.message, true); }
+    });
+  } catch (err) { toast(err.message, true); }
+}
+
 async function importPlaybook() {
-  const file = document.createElement("input");
-  file.type = "file";
-  file.accept = ".json";
-  file.onchange = async () => {
+  const bd = document.createElement("div");
+  bd.className = "modal-backdrop show";
+  bd.innerHTML = `
+    <div class="modal new-pb-modal" role="dialog" aria-modal="true">
+      <h3>Import playbook</h3>
+      <p class="dim">Paste a playbook package JSON, or upload a .json file exported from Playbook Studio.</p>
+      <label style="display:block;margin:10px 0 0">
+        <span class="np-label" style="display:block;font-size:12px;margin-bottom:4px">Paste JSON</span>
+        <textarea class="select area" id="impJson" placeholder='{"format":"kmcp-playbook-package","playbook":{...},"versions":[...]}' spellcheck="false" style="min-height:140px;font-family:ui-monospace,Menlo,monospace"></textarea>
+      </label>
+      <label style="display:block;margin:10px 0 0">
+        <span class="np-label" style="display:block;font-size:12px;margin-bottom:4px">Or upload file</span>
+        <input type="file" id="impFile" accept=".json" />
+      </label>
+      <div class="modal-actions">
+        <button class="btn" id="impCancel">Cancel</button>
+        <button class="btn primary" id="impSubmit">Import</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+  let pkg = null;
+  bd.querySelector("#impFile").addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
     try {
-      const pkg = JSON.parse(await file.files[0].text());
+      pkg = JSON.parse(await file.text());
+      bd.querySelector("#impJson").value = JSON.stringify(pkg, null, 2);
+    } catch { toast("Invalid JSON file", true); }
+  });
+  bd.querySelector("#impCancel").addEventListener("click", () => bd.remove());
+  bd.addEventListener("mousedown", (e) => { if (e.target === bd) bd.remove(); });
+  bd.querySelector("#impSubmit").addEventListener("click", async () => {
+    if (!pkg) {
+      const raw = (bd.querySelector("#impJson").value || "").trim();
+      if (!raw) return toast("Paste JSON or upload a file first", true);
+      try { pkg = JSON.parse(raw); } catch { return toast("Invalid JSON", true); }
+    }
+    const btn = bd.querySelector("#impSubmit");
+    busyBtn(btn, true);
+    try {
       await api("/playbooks", { method: "POST", body: JSON.stringify({ package: pkg }) });
       toast("Imported");
+      bd.remove();
       await refreshPlaybooks();
-    } catch (err) { toast(err.message, true); }
-  };
-  file.click();
+    } catch (err) { toast(err.message, true); busyBtn(btn, false); }
+  });
 }
 
 async function seedPlaybooks() {
@@ -2570,24 +3041,57 @@ async function seedPlaybooks() {
 /* ── route: executions ─────────────────────────────────────────────── */
 
 let execTimer = null;
+let execPage = { limit: 25, offset: 0 };
 
 async function refreshExecutions(status) {
-  const q = status && status !== "all" ? `?status=${encodeURIComponent(status)}` : "?limit=100";
-  const d = await api(`/executions${q}`);
-  const list = d.executions || [];
   const el = $("#execTable");
+  const pg = $("#execPagination");
   if (!el) return;
-  el.innerHTML = table(["Execution", "Playbook", "Trigger", "Status", "Completed"],
-    list.map((e) => ({
-      cells: [
-        `<a href="#/executions/${encodeURIComponent(e.execution_id)}">${esc(e.execution_id)}</a>`,
-        esc(e.playbook_id || "—"),
-        `${esc(e.trigger || "—")}${Number(e.debug) ? " <span class=\"chip ck\">debug</span>" : ""}`,
-        BADGE(e.status),
-        fmtTs(e.completed_at),
-      ],
-      menu: `<a href="#/executions/${encodeURIComponent(e.execution_id)}">detail</a>`,
-    })), "No executions match this filter.");
+  const limit = execPage.limit;
+  const offset = execPage.offset;
+  const q = status && status !== "all" ? `&status=${encodeURIComponent(status)}` : "";
+  el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading executions…</p></div>`;
+  if (pg) pg.innerHTML = "";
+  try {
+    /* Request limit+1 so we can tell whether a next page exists without a
+       count field from the backend. */
+    const d = await api(`/executions?limit=${limit + 1}&offset=${offset}${q}`);
+    const list = d.executions || [];
+    const hasNext = list.length > limit;
+    const rows = list.slice(0, limit);
+    const totalShown = rows.length;
+    const from = offset + 1;
+    const to = offset + totalShown;
+    if (!rows.length) {
+      el.innerHTML = emptyStatePanel("No executions", "There are no workflow runs yet. Run a playbook to create one.", "Retry");
+      el.querySelector("[data-retry]")?.addEventListener("click", () => refreshExecutions($("#execFilter")?.value || "all"));
+      if (pg) pg.innerHTML = "";
+      return;
+    }
+    el.innerHTML = table(["Execution", "Playbook", "Trigger", "Status", "Completed"],
+      rows.map((e) => ({
+        cells: [
+          `<a href="#/executions/${encodeURIComponent(e.execution_id)}">${esc(e.execution_id)}</a>`,
+          esc(e.playbook_id || "—"),
+          `${esc(e.trigger || "—")}${Number(e.debug) ? " <span class=\"chip ck\">debug</span>" : ""}`,
+          BADGE(e.status),
+          fmtTs(e.completed_at),
+        ],
+        menu: `<a href="#/executions/${encodeURIComponent(e.execution_id)}">detail</a>`,
+      })));
+    if (pg) {
+      pg.innerHTML = paginationHtml({ page: Math.floor(offset / limit) + 1, pageSize: limit, total: null, hasPrev: offset > 0, hasNext, from, to });
+      wirePagination(pg, {
+        onPrev: () => { execPage.offset = Math.max(0, execPage.offset - execPage.limit); refreshExecutions($("#execFilter")?.value || "all"); },
+        onNext: () => { execPage.offset += execPage.limit; refreshExecutions($("#execFilter")?.value || "all"); },
+        onSize: (size) => { execPage.limit = +size; execPage.offset = 0; refreshExecutions($("#execFilter")?.value || "all"); },
+      });
+    }
+  } catch (err) {
+    el.innerHTML = emptyStatePanel("Failed to load executions", err.message, "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", () => refreshExecutions($("#execFilter")?.value || "all"));
+    if (pg) pg.innerHTML = "";
+  }
 }
 
 async function runPlaybook(pid) {
@@ -2659,8 +3163,9 @@ async function pageExecutions() {
       </select>
       <label class="checkline"><input type="checkbox" id="execAuto" checked /> auto-refresh every 5s</label>
     </div>
+    <div id="execPagination"></div>
     <div id="execTable">Loading…</div>`;
-  $("#execFilter").addEventListener("change", () => refreshExecutions($("#execFilter").value));
+  $("#execFilter").addEventListener("change", () => { execPage.offset = 0; refreshExecutions($("#execFilter").value); });
   $("#execAuto").addEventListener("change", () => {
     if ($("#execAuto").checked) execTimer = setInterval(() => refreshExecutions($("#execFilter").value), 5000);
     else if (execTimer) { clearInterval(execTimer); execTimer = null; }
@@ -2670,7 +3175,32 @@ async function pageExecutions() {
   await refreshExecutions("all");
 }
 
+/* Compact error/output preview for a single step row. */
+function stepPreview(s) {
+  const err = s.error;
+  if (err) {
+    const t = String(err).trim();
+    return t
+      ? `<span class="dim" style="color:var(--red)">${esc(t.slice(0, 140))}${t.length > 140 ? "…" : ""}</span>`
+      : `<span class="dim" style="color:var(--red)">failed</span>`;
+  }
+  const out = s.outputs;
+  if (out !== null && out !== undefined) {
+    if (typeof out === "object") {
+      const keys = Object.keys(out);
+      if (!keys.length) return `<span class="dim">no output</span>`;
+      const k = keys[0];
+      return `<span class="dim">${esc(k)}: ${esc(String(out[k]).slice(0, 140))}</span>`;
+    }
+    const t = String(out).trim();
+    return t ? `<span class="dim">${esc(t.slice(0, 140))}</span>` : `<span class="dim">no output</span>`;
+  }
+  return `<span class="dim">—</span>`;
+}
+
 function renderExecutionDetail(id, e) {
+  const running = e.status === "running" || e.status === "pending";
+  const resumable = e.status === "failed" || e.status === "cancelled";
   $("#pageHeadInfo").innerHTML = `
     <div class="eyebrow">EXECUTIONS</div><h1>${esc(id)}</h1>
     <div class="subtitle">${esc(e.playbook_id || "")} <span style="margin-left:8px">${BADGE(e.status)}</span>
@@ -2678,17 +3208,21 @@ function renderExecutionDetail(id, e) {
       ${Number(e.debug) ? ` <span class="chip ck" style="margin-left:8px">debug</span>` : ""}
     </div>`;
   $("#pageBody").innerHTML = `
-    <div class="detail-actions">
-      <button class="btn" id="cancelExecBtn">Cancel</button>
-      <button class="btn" id="resumeExecBtn">Resume from checkpoint</button>
+    <div class="detail-actions" id="execActions">
+      <button class="btn danger" id="cancelExecBtn" ${running ? "" : "hidden"}>Cancel</button>
+      <button class="btn" id="resumeExecBtn" ${resumable ? "" : "hidden"}>Resume from checkpoint</button>
+      <button class="btn primary" id="retryExecBtn" ${!running ? "" : "hidden"}>Retry</button>
       <a class="btn ghost" href="#/executions">← back</a>
     </div>
     <div class="panel" style="margin-top:10px;padding:10px"><pre class="result">${colorJson(e)}</pre></div>
     <div class="two-col" style="margin-top:10px">
       <div class="panel" style="min-height:auto">
         <div class="panel-head"><span>Steps</span></div>
-        <div style="padding:6px">${table(["Step", "Tool", "Status"], (e.steps || []).map((s) => ({
-          cells: [esc(s.step_id), esc(s.tool_id || "—"), BADGE(s.status)],
+        <div id="execSteps" style="padding:6px">${table(["Step", "Tool", "Status", "Output / error"], (e.steps || []).map((s) => ({
+          cells: [esc(s.step_id), esc(s.tool_id || "—"), BADGE(s.status), stepPreview(s)],
+          menu: s.status === "failed"
+            ? `<button class="btn ghost" data-rerun-step="${esc(s.step_id)}">Re-run step</button>`
+            : "",
         })), "No steps recorded.")}</div>
       </div>
       <div class="panel" style="min-height:auto">
@@ -2716,12 +3250,53 @@ function renderExecutionDetail(id, e) {
   }
   $("#cancelExecBtn").addEventListener("click", async () => {
     if (!confirm(`Cancel ${id}?`)) return;
-    try { await api(`/executions/${encodeURIComponent(id)}/cancel`, { method: "POST" }); toast("Cancelled"); pageExecutionDetail(id); }
-    catch (err) { toast(err.message, true); }
+    const b = $("#cancelExecBtn");
+    busyBtn(b, true);
+    try {
+      await api(`/executions/${encodeURIComponent(id)}/cancel`, { method: "POST" });
+      toast("Cancelled");
+    } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
+    pageExecutionDetail(id);
   });
   $("#resumeExecBtn").addEventListener("click", async () => {
-    try { await api(`/executions/${encodeURIComponent(id)}/resume`, { method: "POST" }); toast("Resume requested"); pageExecutionDetail(id); }
-    catch (err) { toast(err.message, true); }
+    const b = $("#resumeExecBtn");
+    busyBtn(b, true);
+    try {
+      await api(`/executions/${encodeURIComponent(id)}/resume`, { method: "POST" });
+      toast("Resume requested");
+    } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
+    pageExecutionDetail(id);
+  });
+  $("#retryExecBtn").addEventListener("click", async () => {
+    /* Re-run the same playbook with the same stored inputs as a new execution. */
+    let inputs = e.inputs;
+    if (typeof inputs === "string") {
+      try { inputs = JSON.parse(inputs); } catch { inputs = {}; }
+    }
+    if (!inputs || typeof inputs !== "object" || Array.isArray(inputs)) inputs = {};
+    try {
+      const r = await api("/executions", {
+        method: "POST",
+        body: JSON.stringify({ playbook_id: e.playbook_id, inputs, trigger: "studio" }),
+      });
+      const execId = r?.execution?.execution_id || r?.execution_id || "";
+      if (execId) {
+        toast("Retry started");
+        location.hash = `#/executions/${encodeURIComponent(execId)}`;
+      } else {
+        toast("Retry started — open the executions list to track it");
+      }
+    } catch (err) { toast(err.message, true); }
+  });
+  /* Delegated “Re-run step” on failed steps. No per-step retry endpoint exists,
+   * so explain the limitation instead of hitting a missing route. */
+  $("#execSteps").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-rerun-step]");
+    if (!btn) return;
+    ev.preventDefault();
+    toast("Per-step re-run isn't available via the API yet — use “Resume from checkpoint” to continue this execution, or “Retry” to start a fresh run with the same inputs.");
   });
 }
 
@@ -2763,14 +3338,16 @@ async function pageExecutionDetail(id) {
 /* ── route: tool registry ──────────────────────────────────────────── */
 
 let toolsCache = [];
+let toolsPage = { limit: 25, offset: 0 };
 
 async function refreshTools() {
   const el = $("#toolTable");
-  if (el) el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading tools…</p></div>`;
   const hint = $("#toolHint");
+  if (el) el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading tools…</p></div>`;
   try {
-    const d = await api("/tools?limit=500");
+    const d = await api("/tools?limit=500&offset=0");
     toolsCache = d.tools || [];
+    toolsPage.offset = 0;
     renderTools();
     if (hint) {
       if (toolsCache.length) {
@@ -2783,7 +3360,8 @@ async function refreshTools() {
       }
     }
   } catch (err) {
-    if (el) el.innerHTML = `<div class="panel table-panel"><p class="empty">Failed to load tools: ${esc(err.message)}</p></div>`;
+    if (el) el.innerHTML = emptyStatePanel("Failed to load tools", err.message, "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", refreshTools);
     if (hint) hint.textContent = "";
   }
 }
@@ -2798,22 +3376,44 @@ async function toolRegistryHint() {
 
 function renderTools() {
   const el = $("#toolTable");
+  const pg = $("#toolPagination");
   if (!el) return;
   const q = ($("#toolSearch").value || "").toLowerCase();
-  const rows = toolsCache.filter((t) =>
+  const all = toolsCache.filter((t) =>
     !q || String(t.tool_id).toLowerCase().includes(q) || String(t.name || "").toLowerCase().includes(q));
+  const { limit, offset } = toolsPage;
+  const total = all.length;
+  const pageRows = total ? all.slice(offset, offset + limit) : [];
+  const from = total ? offset + 1 : 0;
+  const to = Math.min(offset + limit, total);
+  const hasPrev = offset > 0;
+  const hasNext = offset + limit < total;
+  if (!pageRows.length) {
+    el.innerHTML = emptyStatePanel("No tools match this search", "Try a different keyword or clear the search field.", "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", refreshTools);
+    if (pg) pg.innerHTML = "";
+    return;
+  }
+  const bar = $("#toolBulkBar");
+  if (bar) bar.style.display = total ? "" : "none";
   el.innerHTML = table(["Tool", "Provider", "Visibility", "Enabled", "Timeout"],
-    rows.map((t) => {
+    pageRows.map((t) => {
       const isBuiltin = t.provider === "native" || t.provider === "builtin";
       const opts = ["agent_callable", "playbook_selectable", "internal", "hidden"]
         .map((v) => `<option value="${v}" ${v === t.visibility ? "selected" : ""}>${v}</option>`).join("");
+      const aliasFor = t.alias_for;
+      const aliasChip = aliasFor
+        ? `<span class="chip alias" title="Alias resolves to ${esc(aliasFor)}">→ ${esc(aliasFor)}</span>`
+        : "";
       return {
-        cells: [esc(t.tool_id), esc(t.provider || "—"),
-          `<select class="select sel-vis" data-tool="${esc(t.tool_id)}">${opts}</select>`,
+        cells: [
+          `<label class="checkline" style="margin:0;display:flex;align-items:center;gap:8px"><input type="checkbox" class="row-sel" value="${esc(t.tool_id)}">${esc(t.tool_id)}</label>`,
+          esc(t.provider || "—"),
+          `<select class="select sel-vis" data-tool="${esc(t.tool_id)}">${opts}</select>${aliasChip}`,
           t.enabled ? "yes" : "no", esc(t.default_timeout ?? "—")],
-        menu: isBuiltin ? `<span class="dim">builtin</span>` : "",
+        menu: `<button class="btn mini" data-toolact="test" data-tool="${esc(t.tool_id)}">Test</button>${isBuiltin ? ' <span class="dim">builtin</span>' : ""}`,
       };
-    }), "No tools registered — import MCP connections to populate the registry.");
+    }));
   $$(".sel-vis", el).forEach((sel) => sel.addEventListener("change", async () => {
     try {
       const id = sel.dataset.tool;
@@ -2821,6 +3421,24 @@ function renderTools() {
       toast(`${id} → ${sel.value}`);
     } catch (err) { toast(err.message, true); }
   }));
+  $$("input.row-sel", el).forEach((cb) => cb.addEventListener("change", () => {
+    const all = $$("input.row-sel", el);
+    const n = all.filter((c) => c.checked).length;
+    $("#bulkCount").textContent = n ? `(${n} selected)` : "";
+  }));
+  $$("[data-toolact=test]", el).forEach((btn) => btn.addEventListener("click", async () => {
+    const id = btn.dataset.tool;
+    const t = toolsCache.find((x) => x.tool_id === id);
+    if (t) await testTool(t);
+  }));
+  if (pg) {
+    pg.innerHTML = paginationHtml({ page: Math.floor(offset / limit) + 1, pageSize: limit, total, hasPrev, hasNext, from, to });
+    wirePagination(pg, {
+      onPrev: () => { toolsPage.offset = Math.max(0, toolsPage.offset - toolsPage.limit); renderTools(); },
+      onNext: () => { toolsPage.offset += toolsPage.limit; renderTools(); },
+      onSize: (size) => { toolsPage.limit = +size; toolsPage.offset = 0; renderTools(); },
+    });
+  }
 }
 
 async function pageTools() {
@@ -2834,9 +3452,150 @@ async function pageTools() {
   $("#pageBody").innerHTML = `
     <div id="toolHint"></div>
     <div class="filterbar"><input class="select" id="toolSearch" placeholder="Search tool id or name…" /></div>
+    <div id="toolBulkBar" style="display:none;gap:10px;align-items:center;margin:8px 0 6px">
+      <label class="checkline"><input type="checkbox" id="bulkSelectAll"> Select all</label>
+      <span class="dim" style="margin:0 6px">· set visibility</span>
+      <select class="select" id="bulkVisibility">
+        <option value="agent_callable">agent_callable</option>
+        <option value="playbook_selectable">playbook_selectable</option>
+        <option value="internal">internal</option>
+        <option value="hidden">hidden</option>
+      </select>
+      <button class="btn primary" id="bulkApply">Apply to selected</button>
+      <span id="bulkCount" class="dim"></span>
+    </div>
+    <div id="toolPagination"></div>
     <div id="toolTable">Loading…</div>`;
-  $("#toolSearch").addEventListener("input", renderTools);
+  $("#toolSearch").addEventListener("input", () => { toolsPage.offset = 0; renderTools(); });
+  $("#bulkSelectAll")?.addEventListener("change", (e) => {
+    const all = $$("input.row-sel", $("#toolTable"));
+    all.forEach((cb) => { cb.checked = e.target.checked; });
+    cbChange();
+  });
+  const cbChange = () => {
+    const all = $$("input.row-sel", $("#toolTable"));
+    const n = all.filter((c) => c.checked).length;
+    $("#bulkSelectAll").checked = n > 0 && n === all.length;
+    $("#bulkCount").textContent = n ? `(${n} selected)` : "";
+  };
+  $("#toolTable").addEventListener("change", (e) => { if (e.target.matches("input.row-sel")) cbChange(); });
+  $("#bulkApply")?.addEventListener("click", async () => {
+    const boxes = $$("input.row-sel:checked", $("#toolTable"));
+    if (!boxes.length) return toast("Select at least one tool", true);
+    const visibility = $("#bulkVisibility").value;
+    const failed = [];
+    for (const cb of boxes) {
+      try {
+        await api(`/tools/${encodeURIComponent(cb.value)}/visibility`, {
+          method: "PUT", body: JSON.stringify({ visibility }),
+        });
+      } catch { failed.push(cb.value); }
+    }
+    const ok = boxes.length - failed.length;
+    toast(failed.length
+      ? `Visibility → ${visibility} for ${ok}/${boxes.length} (${failed.length} failed)`
+      : `Visibility → ${visibility} for ${ok} tool${ok === 1 ? "" : "s"}`, failed.length > 0);
+    await refreshTools();
+  });
   await refreshTools();
+}
+
+/* Test a single tool: render inputs dynamically from its input_schema, run
+   via POST /api/tools/{id}/run, and show the result in the same modal. */
+async function testTool(t) {
+  const rawSchema = t.input_schema;
+  let schema = null;
+  if (rawSchema && typeof rawSchema === "object" && !Array.isArray(rawSchema)) schema = rawSchema;
+  else if (typeof rawSchema === "string") {
+    try { schema = JSON.parse(rawSchema); } catch { schema = null; }
+  }
+  const props = schema && schema.type !== "object" ? null : (schema?.properties || {});
+  const required = schema?.required || [];
+  const fields = Object.entries(props || {}).map(([name, prop]) => {
+    const type = String(prop?.type || "string");
+    const req = required.includes(name);
+    let input;
+    if (type === "boolean") {
+      input = `<select class="select" data-arg="${esc(name)}" data-argtype="boolean">
+        <option value="">— not set</option><option value="true">true</option><option value="false">false</option></select>`;
+    } else if (type === "number" || type === "integer") {
+      input = `<input class="select" type="number" data-arg="${esc(name)}" data-argtype="${type}"
+        placeholder="${esc(prop?.placeholder ?? (type === "number" ? "e.g. 1.5" : "e.g. 30"))}">`;
+    } else if (type === "array" || type === "object") {
+      const deflt = prop?.default === undefined ? "" : JSON.stringify(prop.default);
+      input = `<textarea class="select area mono" data-arg="${esc(name)}" data-argtype="${type}"
+        style="min-height:56px;font-family:ui-monospace,Menlo,monospace" spellcheck="false"
+        placeholder="JSON ${type}">${esc(deflt)}</textarea>`;
+    } else {
+      input = `<input class="select" data-arg="${esc(name)}" data-argtype="string"
+        placeholder="${esc(prop?.description || "")}">`;
+    }
+    return `<div class="run-row" style="margin:8px 0">
+      <div class="run-row-head"><b class="mono">${esc(name)}</b>
+        <span class="chip ${req ? "ck" : ""}">${esc(type)}${req ? " · required" : ""}</span>
+        ${helpTip(prop?.description || "")}
+      </div>${input}</div>`;
+  }).join("") || `<p class="dim">This tool takes no declared inputs.</p>`;
+
+  const bd = document.createElement("div");
+  bd.className = "modal-backdrop show";
+  bd.innerHTML = `
+    <div class="modal run-modal" style="max-width:660px">
+      <h3>Test tool “${esc(t.tool_id)}”</h3>
+      <p class="dim">${esc(t.name || t.tool_id)} · provider ${esc(t.provider || "—")} · visibility ${esc(t.visibility || "—")}</p>
+      <div id="testToolFields">${fields}</div>
+      <div id="testToolResult" hidden style="margin-top:12px;border:1px solid var(--line);border-radius:9px;padding:10px">
+        <div style="font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);margin-bottom:6px">Result</div>
+        <pre class="result" id="testToolResultBody" style="max-height:300px;overflow:auto"></pre>
+      </div>
+      <div class="modal-actions">
+        <button class="btn" id="testToolCancel">Cancel</button>
+        <button class="btn primary" id="testToolRun">▶ Run tool</button>
+      </div>
+    </div>`;
+  document.body.appendChild(bd);
+  const runBtn = bd.querySelector("#testToolRun");
+  bd.querySelector("#testToolCancel").addEventListener("click", () => bd.remove());
+  bd.addEventListener("mousedown", (e) => { if (e.target === bd) bd.remove(); });
+  runBtn.addEventListener("click", async () => {
+    const args = {};
+    let ok = true;
+    bd.querySelectorAll("[data-arg]").forEach((el) => {
+      const name = el.dataset.arg;
+      const type = el.dataset.argtype || "string";
+      const raw = el.value;
+      if (type === "boolean") { if (raw) args[name] = raw === "true"; return; }
+      if (type === "integer") { if (String(raw).trim() === "") return; args[name] = parseInt(raw, 10); return; }
+      if (type === "number") { if (String(raw).trim() === "") return; args[name] = parseFloat(raw); return; }
+      if (type === "array" || type === "object") {
+        const txt = String(raw).trim();
+        if (!txt) return;
+        try { args[name] = JSON.parse(txt); }
+        catch { toast(`Argument “${name}” must be valid JSON`, true); ok = false; }
+        return;
+      }
+      const txt = String(raw).trim();
+      if (txt) args[name] = txt;
+    });
+    if (!ok) return;
+    runBtn.disabled = true;
+    const resPanel = bd.querySelector("#testToolResult");
+    const resBody = bd.querySelector("#testToolResultBody");
+    resPanel.hidden = true;
+    resBody.textContent = "";
+    try {
+      const res = await api(`/tools/${encodeURIComponent(t.tool_id)}/run`, {
+        method: "POST", body: JSON.stringify({ args }),
+      });
+      resPanel.hidden = false;
+      resBody.innerHTML = colorJson(res && typeof res.result !== "undefined" ? res.result : res);
+      toast("Tool ran");
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      runBtn.disabled = false;
+    }
+  });
 }
 
 /* ── route: connections ────────────────────────────────────────────── */
@@ -2844,9 +3603,17 @@ async function pageTools() {
 let connectionsCache = [];
 
 async function refreshConnections() {
-  const d = await api("/connections");
-  connectionsCache = d.connections || [];
-  renderConnections();
+  const el = $("#connTable");
+  if (!el) return;
+  el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading connections…</p></div>`;
+  try {
+    const d = await api("/connections");
+    connectionsCache = d.connections || [];
+    renderConnections();
+  } catch (err) {
+    el.innerHTML = emptyStatePanel("Failed to load connections", err.message, "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", refreshConnections);
+  }
 }
 
 function renderConnections() {
@@ -2861,21 +3628,26 @@ function renderConnections() {
         c.enabled ? BADGE(c.health_status || "unknown") : "disabled",
         esc(c.imported_tool_count ?? 0),
       ],
-      menu: `<button class="btn mini" data-conn="${esc(c.connection_id)}" data-connact="test">Test</button>
+      menu: `<button class="btn mini" data-conn="${esc(c.connection_id)}" data-connact="edit">Edit</button>
+             <button class="btn mini" data-conn="${esc(c.connection_id)}" data-connact="test">Test</button>
              <button class="btn mini" data-conn="${esc(c.connection_id)}" data-connact="discover">Discover</button>
              <button class="btn mini danger" data-conn="${esc(c.connection_id)}" data-connact="delete">Delete</button>`,
-    }), "No connections yet. Add one to import external MCP tools."));
+    }), { emptyText: "No connections yet. Add one to import external MCP tools.", emptyLabel: "Add connection" }));
+  el.querySelector("[data-retry]")?.addEventListener("click", connectionModal);
   $$("button[data-conn]", el).forEach((btn) => btn.addEventListener("click", async () => {
     const id = btn.dataset.conn;
     const act = btn.dataset.connact;
+    if (act === "edit") { await editConnection(id); return; }
     if (act === "delete" && !confirm(`Delete connection ${id}?`)) return;
     const map = {
       test: { path: `/connections/${encodeURIComponent(id)}/test`, method: "POST" },
       discover: { path: `/connections/${encodeURIComponent(id)}/discover`, method: "POST", body: "{}" },
       delete: { path: `/connections/${encodeURIComponent(id)}`, method: "DELETE" },
     }[act];
+    busyBtn(btn, true);
     try { await api(map.path, { method: map.method, body: map.body }); toast(act + " ok"); refreshConnections(); }
     catch (err) { toast(err.message, true); }
+    busyBtn(btn, false);
   }));
 }
 
@@ -2903,6 +3675,34 @@ async function connectionModal() {
   } catch (err) { toast(err.message, true); }
 }
 
+async function editConnection(id) {
+  const d = await api(`/connections/${encodeURIComponent(id)}`);
+  const c = d.connection;
+  const v = await formModal({
+    title: "Edit connection",
+    subtitle: `Editing ${esc(c.connection_id)}`,
+    fields: [
+      { name: "name", label: "Friendly name", value: c.name || "" },
+      { name: "transport", label: "Transport", type: "select", value: c.transport || "sse", options: ["sse", "streamable-http", "stdio"] },
+      { name: "endpoint_url", label: "endpoint_url", required: false, value: c.endpoint_url || "", placeholder: "http://127.0.0.1:9000/sse", hint: "Required for sse / streamable-http transports." },
+      { name: "command", label: "command", required: false, value: c.command || "", placeholder: "e.g. npx mcp-server-fs", hint: "Required for the stdio transport." },
+      { name: "description", label: "Description", required: false, value: c.description || "", placeholder: "Optional description" },
+    ],
+    submitLabel: "Save changes",
+  });
+  if (!v) return;
+  const payload = { name: v.name, transport: v.transport };
+  if (v.endpoint_url !== undefined) payload.endpoint_url = v.endpoint_url;
+  if (v.command !== undefined) payload.command = v.command;
+  if (v.description !== undefined) payload.description = v.description;
+  try {
+    await api(`/connections/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(payload) });
+    toast("Connection updated");
+    await refreshConnections();
+    if (location.hash === `#/connections/${encodeURIComponent(id)}`) await pageConnectionDetail(id);
+  } catch (err) { toast(err.message, true); }
+}
+
 async function pageConnections() {
   setPageMeta({
     crumb: "MCP Connections", title: "MCP Connections", subtitle: "External servers & imported tool counts",
@@ -2916,48 +3716,93 @@ async function pageConnections() {
 }
 
 async function pageConnectionDetail(id) {
-  setPageMeta({ crumb: "MCP Connections", title: id, subtitle: "Connection detail" });
+  setPageMeta({ crumb: "MCP Connections", title: `${esc(id)} connection`, subtitle: "Connection detail" });
   const d = await api(`/connections/${encodeURIComponent(id)}`);
   const c = d.connection;
+  const health = c.health_status || "unknown";
+  const endpoint = c.endpoint_url || c.command || "—";
   $("#pageHeadInfo").innerHTML = `
-    <div class="eyebrow">MCP CONNECTIONS</div><h1>${esc(id)}</h1>
-    <div class="subtitle">${esc(c.name || "")} · transport ${esc(c.transport)} ${BADGE(c.health_status || "unknown")}</div>`;
+    <div class="eyebrow">MCP CONNECTIONS</div><h1>${esc(c.name || id)}</h1>
+    <div class="subtitle">${esc(c.connection_id)} · ${esc(c.transport)} ${BADGE(health)}</div>`;
+  $("#pageHeadActions").innerHTML = headActionsHtml([
+    { id: "connEditBtn", label: "Edit" },
+    { id: "connDelBtn", label: "Delete connection", cls: "danger" },
+  ]);
   $("#pageBody").innerHTML = `
     <div class="detail-actions"><a class="btn ghost" href="#/connections">← back</a></div>
-    <div class="panel" style="padding:14px"><pre class="result">${esc(JSON.stringify(c, null, 2))}</pre></div>
-    <div class="panel" style="min-height:120px;margin-top:14px">
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><span>Identity</span></div>
+        <div style="padding:8px">${table(["Field", "Value"], [
+          { cells: ["Connection id", `<span class="mono">${esc(c.connection_id)}</span>`] },
+          { cells: ["Name", esc(c.name || "—")] },
+          { cells: ["Transport", esc(c.transport)] },
+        ])}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><span>Endpoint &amp; health</span></div>
+        <div style="padding:8px">${table(["Field", "Value"], [
+          { cells: ["endpoint_url / command", `<span class="mono">${esc(endpoint)}</span>`] },
+          { cells: ["Health", BADGE(health)] },
+          { cells: ["Enabled", c.enabled ? "Yes" : "No"] },
+        ])}</div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:16px">
       <div class="panel-head"><span>Imported tools</span>
         <button class="btn mini" id="discoverBtn">Discover &amp; import</button></div>
       <div style="padding:8px">${table(["Tool", "Visibility"], (d.imported_tools || []).map((t) => ({
         cells: [esc(t.tool_id), esc(t.visibility || "—")],
-      })), "Nothing imported from this connection yet.")}</div>
+      })), "Nothing imported from this connection yet. Use Discover &amp; import to pull tools from the server.")}</div>
     </div>`;
   $("#discoverBtn").addEventListener("click", async () => {
+    const b = $("#discoverBtn");
+    busyBtn(b, true);
     try {
       const r = await api(`/connections/${encodeURIComponent(id)}/discover`, { method: "POST", body: "{}" });
       toast(`Imported ${(r.imported_tools || []).length} tools`);
       pageConnectionDetail(id);
     } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
+  });
+  $("#connEditBtn").addEventListener("click", () => editConnection(id));
+  $("#connDelBtn").addEventListener("click", async () => {
+    if (!confirm(`Delete connection "${esc(c.connection_id)}"?`)) return;
+    const b = $("#connDelBtn");
+    busyBtn(b, true);
+    try {
+      await api(`/connections/${encodeURIComponent(id)}`, { method: "DELETE" });
+      toast("Connection deleted");
+      location.hash = "#/connections";
+    } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
   });
 }
 
 /* ── route: agents ─────────────────────────────────────────────────── */
 
 async function refreshAgents() {
-  const d = await api("/agents");
-  const agents = d.agents || [];
   const el = $("#agentTable");
   if (!el) return;
-  el.innerHTML = table(["Profile", "Description", "Default visibility", "Parallel / Timeout", "Grants"],
-    agents.map((a) => ({
-      cells: [
-        `<a href="#/agents/${encodeURIComponent(a.profile_id)}">${esc(a.profile_id)}</a><br/><small class="dim">${esc(a.name || "")}</small>`,
-        esc(a.description || "—"),
-        esc(a.default_visibility || "internal"),
-        `${a.max_parallel_operations ?? "—"} / ${a.max_execution_seconds ?? "—"}s`,
-        `tools: ${a.tool_grants ?? 0} · playbooks: ${a.playbook_grants ?? 0}`,
-      ],
-    })), "No agent profiles. One is created for you on first tool grant.");
+  el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading agent profiles…</p></div>`;
+  try {
+    const d = await api("/agents");
+    const agents = d.agents || [];
+    el.innerHTML = table(["Profile", "Description", "Default visibility", "Parallel / Timeout", "Grants"],
+      agents.map((a) => ({
+        cells: [
+          `<a href="#/agents/${encodeURIComponent(a.profile_id)}">${esc(a.profile_id)}</a><br/><small class="dim">${esc(a.name || "")}</small>`,
+          esc(a.description || "—"),
+          esc(a.default_visibility || "internal"),
+          `${a.max_parallel_operations ?? "—"} / ${a.max_execution_seconds ?? "—"}s`,
+          `tools: ${a.tool_grants ?? 0} · playbooks: ${a.playbook_grants ?? 0}`,
+        ],
+      })), { emptyText: "No agent profiles. One is created for you on first tool grant.", emptyLabel: "New profile" });
+    el.querySelector("[data-retry]")?.addEventListener("click", agentModal);
+  } catch (err) {
+    el.innerHTML = emptyStatePanel("Failed to load agents", err.message, "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", refreshAgents);
+  }
 }
 
 async function agentModal() {
@@ -2993,16 +3838,45 @@ async function pageAgents() {
   await refreshAgents();
 }
 
+async function editAgentProfile(id) {
+  const d = await api(`/agents/${encodeURIComponent(id)}`);
+  const a = d.agent;
+  const v = await formModal({
+    title: "Edit profile",
+    subtitle: `Rename “${esc(a.name || id)}” and update its description.`,
+    fields: [
+      { name: "name", label: "Name", value: a.name || "", placeholder: "e.g. Red team agent" },
+      { name: "description", label: "Description", type: "area", required: false,
+        value: a.description || "", placeholder: "What this agent is allowed to do…" },
+    ],
+    submitLabel: "Save changes",
+  });
+  if (!v) return;
+  try {
+    await api(`/agents/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ name: v.name, description: v.description }),
+    });
+    toast("Profile updated");
+    pageAgentDetail(id);
+  } catch (err) { toast(err.message, true); }
+}
+
 async function pageAgentDetail(id) {
   setPageMeta({ crumb: "Agents", title: id, subtitle: "Agent profile" });
   const d = await api(`/agents/${encodeURIComponent(id)}`);
   const a = d.agent;
   const catalogs = d.effective_catalog || {};
+  const perms = (d.permissions || []).filter((p) => p.profile_id === id);
+  const grantedTools = perms.filter((p) => p.granted);
+  const asgs = (d.assignments || []).filter((x) => x.profile_id === id);
+  const assignedPlaybooks = asgs.filter((x) => x.granted);
   $("#pageHeadInfo").innerHTML = `
     <div class="eyebrow">AGENTS</div><h1>${esc(id)}</h1>
     <div class="subtitle">${esc(a.name || "")} · parallel ${a.max_parallel_operations ?? "—"} · timeout ${a.max_execution_seconds ?? "—"}s</div>`;
   $("#pageBody").innerHTML = `
     <div class="detail-actions"><a class="btn ghost" href="#/agents">← back</a>
+      <button class="btn" id="editAgentBtn">Edit profile</button>
       <button class="btn danger" id="delAgentBtn">Delete profile</button></div>
     ${kpis([
       { label: "Callable tools", value: catalogs.tools?.length ?? 0 },
@@ -3011,70 +3885,126 @@ async function pageAgentDetail(id) {
     ])}
     <div class="panel" style="min-height:140px;margin-top:14px">
       <div class="panel-head"><span>Tool grants</span>
-        <button class="btn mini" id="grantBtn">Grant tool</button></div>
-      <div style="padding:8px">${table(["Tool", "Granted", "Granted at"],
-        (d.permissions || []).filter((p) => p.profile_id === id).map((p) => ({
-          cells: [esc(p.tool_id), p.granted ? "<span class='run-state ok'>granted</span>" : "<span class='run-state failed'>denied</span>",
-            fmtTs(p.granted_at)],
-          menu: `<button class="btn mini danger" data-tool="${esc(p.tool_id)}" data-toolact="revoke">Revoke</button>`,
+        <button class="btn mini" id="grantBtn">Grant tool</button>
+        <button class="btn mini danger" id="revokeAllBtn" ${grantedTools.length ? "" : "hidden"}>Revoke all</button>
+      </div>
+      <div style="padding:8px">${table(["Tool", "Status", "Granted at", "Action"],
+        perms.map((p) => ({
+          cells: [
+            esc(p.tool_id),
+            p.granted ? "<span class='run-state ok'>granted</span>" : "<span class='run-state failed'>denied</span>",
+            fmtTs(p.granted_at),
+            `<button class="btn mini danger" data-tool="${esc(p.tool_id)}" data-toolact="revoke">Revoke</button>`,
+          ],
         })), "No tool grants yet. Grant one to allow this agent to call a tool.")}</div>
     </div>
     <div class="panel" style="min-height:140px;margin-top:14px">
       <div class="panel-head"><span>Playbook assignments</span>
-        <button class="btn mini" id="assignBtn">Assign playbook</button></div>
-      <div style="padding:8px">${table(["Playbook", "Granted", "Granted at"],
-        (d.assignments || []).filter((x) => x.profile_id === id).map((x) => ({
-          cells: [esc(x.playbook_id), x.granted ? "<span class='run-state ok'>assigned</span>" : "<span class='run-state failed'>blocked</span>",
-            fmtTs(x.granted_at)],
-          menu: `<button class="btn mini danger" data-pb="${esc(x.playbook_id)}" data-pbact="unassign">Unassign</button>`,
+        <button class="btn mini" id="assignBtn">Assign playbook</button>
+        <button class="btn mini danger" id="unassignAllBtn" ${assignedPlaybooks.length ? "" : "hidden"}>Unassign all</button>
+      </div>
+      <div style="padding:8px">${table(["Playbook", "Status", "Granted at", "Action"],
+        asgs.map((x) => ({
+          cells: [
+            esc(x.playbook_id),
+            x.granted ? "<span class='run-state ok'>assigned</span>" : "<span class='run-state failed'>blocked</span>",
+            fmtTs(x.granted_at),
+            `<button class="btn mini danger" data-pb="${esc(x.playbook_id)}" data-pbact="unassign">Unassign</button>`,
+          ],
         })), "No playbook assignments yet.")}</div>
     </div>`;
+  $("#editAgentBtn").addEventListener("click", () => editAgentProfile(id));
   $("#grantBtn").addEventListener("click", async () => {
+    const b = $("#grantBtn");
+    busyBtn(b, true);
     try {
       const d = await api("/tools?limit=500");
       const opts = (d.tools || []).map((t) => t.tool_id).filter(Boolean).sort();
-      if (!opts.length) return toast("No tools registered to grant", true);
+      if (!opts.length) { busyBtn(b, false); return toast("No tools registered to grant", true); }
       const v = await formModal({
         title: "Grant tool",
-        subtitle: `Allows profile “${id}” to call this tool.`,
+        subtitle: `Allows profile “${esc(id)}” to call this tool.`,
         fields: [{ name: "tool_id", label: "Tool", type: "select", options: opts }],
         submitLabel: "Grant",
       });
-      if (!v) return;
+      if (!v) { busyBtn(b, false); return; }
       await api(`/agents/${encodeURIComponent(id)}/tools/${encodeURIComponent(v.tool_id)}`, { method: "PUT", body: "{}" });
       toast("Granted");
-      pageAgentDetail(id);
     } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
+    pageAgentDetail(id);
+  });
+  $("#revokeAllBtn").addEventListener("click", async () => {
+    if (!confirm(`Revoke all ${grantedTools.length} tool grant${grantedTools.length === 1 ? "" : "s"} for “${esc(id)}”?`)) return;
+    const failed = [];
+    for (const p of grantedTools) {
+      try {
+        await api(`/agents/${encodeURIComponent(id)}/tools/${encodeURIComponent(p.tool_id)}`, { method: "DELETE" });
+      } catch { failed.push(p.tool_id); }
+    }
+    const okCount = grantedTools.length - failed.length;
+    if (failed.length) return toast(`Revoked ${okCount}/${grantedTools.length}; failed: ${failed.join(", ")}`, true);
+    toast(`Revoked ${grantedTools.length} tool grant${grantedTools.length === 1 ? "" : "s"}`);
+    pageAgentDetail(id);
   });
   $("#assignBtn").addEventListener("click", async () => {
+    const b = $("#assignBtn");
+    busyBtn(b, true);
     try {
       const d = await api("/playbooks");
       const opts = (d.playbooks || []).map((p) => p.playbook_id).filter(Boolean).sort();
-      if (!opts.length) return toast("No playbooks available to assign", true);
+      if (!opts.length) { busyBtn(b, false); return toast("No playbooks available to assign", true); }
       const v = await formModal({
         title: "Assign playbook",
-        subtitle: `Allows profile “${id}” to run this playbook.`,
+        subtitle: `Allows profile “${esc(id)}” to run this playbook.`,
         fields: [{ name: "playbook_id", label: "Playbook", type: "select", options: opts }],
         submitLabel: "Assign",
       });
-      if (!v) return;
+      if (!v) { busyBtn(b, false); return; }
       await api(`/agents/${encodeURIComponent(id)}/playbooks/${encodeURIComponent(v.playbook_id)}`, { method: "PUT", body: "{}" });
       toast("Assigned");
-      pageAgentDetail(id);
     } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
+    pageAgentDetail(id);
   });
-  $("#delAgentBtn").addEventListener("click", () => {
-    if (!confirm(`Delete agent profile ${id}?`)) return;
-    api(`/agents/${encodeURIComponent(id)}`, { method: "DELETE" })
-      .then(() => { toast("Deleted"); location.hash = "#/agents"; })
-      .catch((err) => toast(err.message, true));
+  $("#unassignAllBtn").addEventListener("click", async () => {
+    if (!confirm(`Unassign all ${assignedPlaybooks.length} playbook${assignedPlaybooks.length === 1 ? "" : "s"} from “${esc(id)}”?`)) return;
+    const failed = [];
+    for (const x of assignedPlaybooks) {
+      try {
+        await api(`/agents/${encodeURIComponent(id)}/playbooks/${encodeURIComponent(x.playbook_id)}`, { method: "DELETE" });
+      } catch { failed.push(x.playbook_id); }
+    }
+    const okCount = assignedPlaybooks.length - failed.length;
+    if (failed.length) return toast(`Unassigned ${okCount}/${assignedPlaybooks.length}; failed: ${failed.join(", ")}`, true);
+    toast(`Unassigned ${assignedPlaybooks.length} playbook${assignedPlaybooks.length === 1 ? "" : "s"}`);
+    pageAgentDetail(id);
+  });
+  $("#delAgentBtn").addEventListener("click", async () => {
+    if (!confirm(`Delete agent profile ${esc(id)}?`)) return;
+    const b = $("#delAgentBtn");
+    busyBtn(b, true);
+    try {
+      await api(`/agents/${encodeURIComponent(id)}`, { method: "DELETE" });
+      toast("Deleted");
+      location.hash = "#/agents";
+    } catch (err) { toast(err.message, true); busyBtn(b, false); }
+    busyBtn(b, false);
   });
   $$("button[data-tool]", $("#pageBody")).forEach((b) => b.addEventListener("click", async () => {
-    await api(`/agents/${encodeURIComponent(id)}/tools/${encodeURIComponent(b.dataset.tool)}`, { method: "DELETE" });
+    busyBtn(b, true);
+    try {
+      await api(`/agents/${encodeURIComponent(id)}/tools/${encodeURIComponent(b.dataset.tool)}`, { method: "DELETE" });
+    } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
     pageAgentDetail(id);
   }));
   $$("button[data-pb]", $("#pageBody")).forEach((b) => b.addEventListener("click", async () => {
-    await api(`/agents/${encodeURIComponent(id)}/playbooks/${encodeURIComponent(b.dataset.pb)}`, { method: "DELETE" });
+    busyBtn(b, true);
+    try {
+      await api(`/agents/${encodeURIComponent(id)}/playbooks/${encodeURIComponent(b.dataset.pb)}`, { method: "DELETE" });
+    } catch (err) { toast(err.message, true); }
+    busyBtn(b, false);
     pageAgentDetail(id);
   }));
 }
@@ -3083,6 +4013,9 @@ async function pageAgentDetail(id) {
 
 /* rows cached by id so the row click can open the full detail modal */
 let findingsCache = [];
+let fndPage = { limit: 25, offset: 0 };
+let fndSort = { col: null, dir: "asc" };
+let findingsTimer = null;
 
 function findingDetailModal(f) {
   const bd = document.createElement("div");
@@ -3127,7 +4060,46 @@ function findingDetailModal(f) {
   bd.querySelector("#fndDetailClose").addEventListener("click", () => bd.remove());
 }
 
+/* Move the matching count to the page-top right corner (minimal number badge). */
+function updateFindingsCountBadge(total) {
+  const headRight = $(".head-right");
+  if (!headRight) return;
+  const old = headRight.querySelector(".fnd-count-badge");
+  if (old) old.remove();
+  const badge = document.createElement("span");
+  badge.className = "fnd-count-badge";
+  badge.textContent = `${total ?? 0} findings`;
+  badge.style.cssText = "padding:4px 10px; background:var(--panel2); border:1px solid var(--line); border-radius:9px; font-size:12.5px; color:var(--muted); margin-left:8px; white-space:nowrap;";
+  headRight.appendChild(badge);
+}
+
+/* Client-side sort of the cached findings by the current sort state.
+   Column indexes: 0 Title, 1 Severity, 2 Tool, 3 Target, 4 Status, 5 Created. */
+function sortFindings(rows, state) {
+  if (!state || !state.col) return rows.slice();
+  const keyFor = (f) => {
+    switch (state.col) {
+      case 0: return f.title || f.test_name || f.checkname || f.name || "";
+      case 1: return f.severity || "";
+      case 2: return f.tool || "";
+      case 3: return f.target || "";
+      case 4: return f.status || f.validation_status || "";
+      case 5: return f.created_at || "";
+      default: return "";
+    }
+  };
+  return rows.slice().sort((a, b) => {
+    const av = String(keyFor(a)); const bv = String(keyFor(b));
+    let c = 0;
+    if (av < bv) c = -1; else if (av > bv) c = 1;
+    return state.dir === "asc" ? c : -c;
+  });
+}
+
 async function refreshFindings() {
+  const el = $("#findingTable");
+  const pg = $("#findingPagination");
+  if (!el) return;
   const params = new URLSearchParams();
   const sev = $("#fndSeverity")?.value;
   const tgt = $("#fndTarget")?.value?.trim();
@@ -3135,36 +4107,80 @@ async function refreshFindings() {
   if (sev && sev !== "all") params.set("severity", sev);
   if (tgt) params.set("target", tgt);
   if (tool) params.set("tool", tool);
-  const d = await api(`/findings?${params}`);
-  const el = $("#findingTable");
-  if (!el) return;
-  findingsCache = d.findings || [];
-  const byId = new Map(findingsCache.map((f) => [String(f.id), f]));
-  el.innerHTML = `${table(["Title", "Severity", "Tool", "Target", "Status", "Created"],
-    findingsCache.map((f) => ({
-      cells: [esc(f.title || f.test_name || f.checkname || f.name || "—"), BADGE(f.severity), esc(f.tool), esc(f.target || "—"), esc(f.status || f.validation_status || "—"), fmtTs(f.created_at)],
-      menu: `<button class="btn ghost fnd-view" data-fid="${esc(String(f.id))}">View</button>`,
-    })), "No findings match these filters.")}`;
-  /* row click opens the detail modal — delegation survives table re-render */
-  el.onclick = (e) => {
-    const btn = e.target.closest(".fnd-view");
-    const row = e.target.closest(".table-row");
-    if (btn || row) {
-      const fid = btn?.dataset.fid || row?.querySelector(".fnd-view")?.dataset.fid;
-      const f = byId.get(String(fid));
-      if (f) findingDetailModal(f);
+  params.set("limit", fndPage.limit);
+  params.set("offset", fndPage.offset);
+  el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading findings…</p></div>`;
+  if (pg) pg.innerHTML = "";
+  try {
+    const d = await api(`/findings?${params}`);
+    findingsCache = d.findings || [];
+    const total = d.count ?? 0;
+    const sorted = sortFindings(findingsCache, fndSort);
+    const pageRows = sorted.slice(fndPage.offset, fndPage.offset + fndPage.limit);
+    const from = total ? fndPage.offset + 1 : 0;
+    const to = Math.min(fndPage.offset + fndPage.limit, total);
+    const hasPrev = fndPage.offset > 0;
+    const hasNext = fndPage.offset + fndPage.limit < total;
+    if (!pageRows.length) {
+      el.innerHTML = emptyStatePanel("No findings match these filters", "Try clearing filters or check that scan data exists.", "Retry");
+      el.querySelector("[data-retry]")?.addEventListener("click", refreshFindings);
+      if (pg) pg.innerHTML = "";
+      updateFindingsCountBadge(0);
+      return;
     }
-  };
-  // move the matching count to the page-top right corner (minimal number badge)
-  const headRight = $(".head-right");
-  if (headRight) {
-    const old = headRight.querySelector(".fnd-count-badge");
-    if (old) old.remove();
-    const badge = document.createElement("span");
-    badge.className = "fnd-count-badge";
-    badge.textContent = `${d.count ?? 0} findings`;
-    badge.style.cssText = "padding:4px 10px; background:var(--panel2); border:1px solid var(--line); border-radius:9px; font-size:12.5px; color:var(--muted); margin-left:8px; white-space:nowrap;";
-    headRight.appendChild(badge);
+    const byId = new Map(pageRows.map((f) => [String(f.id), f]));
+    el.innerHTML = table(["Title", "Severity", "Tool", "Target", "Status", "Created"],
+      pageRows.map((f) => ({
+        id: String(f.id),
+        cells: [esc(f.title || f.test_name || f.checkname || f.name || "—"), BADGE(f.severity), esc(f.tool), esc(f.target || "—"), esc(f.status || f.validation_status || "—"), fmtTs(f.created_at)],
+        menu: `<button class="btn ghost fnd-view" data-fid="${esc(String(f.id))}">View</button>`,
+      })),
+      { sortable: [0, 1, 2, 3, 4, 5], sortState: fndSort, selectable: true });
+    /* row click opens the detail modal — delegation survives table re-render */
+    el.onclick = (e) => {
+      if (e.target.tagName === "INPUT" && e.target.type === "checkbox") return;
+      const btn = e.target.closest(".fnd-view");
+      const row = e.target.closest(".table-row");
+      if (btn || row) {
+        const fid = btn?.dataset.fid || row?.querySelector(".fnd-view")?.dataset.fid;
+        const f = byId.get(String(fid));
+        if (f) findingDetailModal(f);
+      }
+    };
+    /* Select all / per-row checkbox wiring */
+    const selAll = $("#selAll");
+    const selRows = $$(".sel-row", el);
+    if (selAll) {
+      selAll.addEventListener("change", () => {
+        const checked = selAll.checked;
+        selRows.forEach((cb) => { cb.checked = checked; });
+      });
+      selRows.forEach((cb) => cb.addEventListener("change", () => {
+        const all = selRows.length > 0 && selRows.every((c) => c.checked);
+        selAll.checked = all;
+      }));
+    }
+    wireSortHeaders(el, (col) => {
+      if (fndSort.col === col) fndSort.dir = fndSort.dir === "asc" ? "desc" : "asc";
+      else { fndSort.col = col; fndSort.dir = "asc"; }
+      refreshFindings();
+    });
+    if (pg) {
+      pg.innerHTML = paginationHtml({ page: Math.floor(fndPage.offset / fndPage.limit) + 1, pageSize: fndPage.limit, total, hasPrev, hasNext, from, to });
+      wirePagination(pg, {
+        onPrev: () => { fndPage.offset = Math.max(0, fndPage.offset - fndPage.limit); refreshFindings(); },
+        onNext: () => { fndPage.offset += fndPage.limit; refreshFindings(); },
+        onSize: (size) => { fndPage.limit = +size; fndPage.offset = 0; refreshFindings(); },
+      });
+    }
+    updateFindingsCountBadge(total);
+    const bulk = $("#fndBulk");
+    if (bulk) bulk.style.display = pageRows.length ? "" : "none";
+  } catch (err) {
+    el.innerHTML = emptyStatePanel("Failed to load findings", err.message, "Retry");
+    el.querySelector("[data-retry]")?.addEventListener("click", refreshFindings);
+    if (pg) pg.innerHTML = "";
+    updateFindingsCountBadge(0);
   }
 }
 
@@ -3176,6 +4192,17 @@ async function pageFindings() {
   $("#pageHeadInfo").innerHTML = `
     <div class="eyebrow">FINDINGS</div><h1>Findings</h1>
     <div class="subtitle">Query normalized findings. Filters hit the database directly.</div>`;
+  /* Bulk actions toolbar (shown only when there are findings to act on). */
+  $("#pageHeadActions").innerHTML = `
+    <div class="bulk-toolbar" id="fndBulk" style="display:none;align-items:center;gap:8px;flex-wrap:wrap">
+      <span class="dim">Bulk actions:</span>
+      <select class="select" id="fndBulkAction" style="width:230px">
+        <option value="">— Choose action —</option>
+        <option value="resolved">Mark selected as resolved</option>
+        <option value="open">Mark selected as open</option>
+        <option value="delete">Delete selected findings</option>
+      </select>
+    </div>`;
   $("#pageBody").innerHTML = `
     <div class="filterbar" style="gap:8px">
       <select id="fndSeverity" class="select" style="width:150px">
@@ -3187,17 +4214,61 @@ async function pageFindings() {
       <input class="select" id="fndTarget" placeholder="target…" style="width:180px" />
       <input class="select" id="fndTool" placeholder="tool…" style="width:180px" />
       <button class="btn primary" id="fndGo">Apply</button>
+      <label class="checkline"><input type="checkbox" id="fndAuto" /> auto-refresh every 5s</label>
     </div>
+    <div id="findingPagination"></div>
     <div id="findingTable">Loading…</div>`;
-  $("#fndGo").addEventListener("click", refreshFindings);
-  $("#fndSeverity").addEventListener("change", refreshFindings);
+  $("#fndGo").addEventListener("click", () => { fndPage.offset = 0; refreshFindings(); });
+  $("#fndSeverity").addEventListener("change", () => { fndPage.offset = 0; refreshFindings(); });
+  $("#fndAuto").addEventListener("change", () => {
+    if ($("#fndAuto").checked) findingsTimer = setInterval(refreshFindings, 5000);
+    else if (findingsTimer) { clearInterval(findingsTimer); findingsTimer = null; }
+  });
+  $("#fndBulkAction").addEventListener("change", (e) => {
+    const action = e.target.value;
+    if (!action) return;
+    e.target.value = ""; // reset so re-picking the same action re-triggers
+    bulkFindingsAction(action);
+  });
+  await refreshFindings();
+}
+
+/* Bulk actions on selected findings: resolve / open / delete.
+   Confirms, then calls PUT /api/findings/{id} or DELETE /api/findings/{id}
+   per finding and toasts the count. */
+async function bulkFindingsAction(action) {
+  const el = $("#findingTable");
+  if (!el) return;
+  const cbs = $$(".sel-row:checked", el);
+  const fids = cbs.map((cb) => cb.dataset.fid);
+  if (!fids.length) return toast("No findings selected", true);
+  const plural = fids.length !== 1 ? "s" : "";
+  if (action === "delete") {
+    if (!confirm(`Delete ${fids.length} finding${plural}?`)) return;
+  } else if (!confirm(`Mark ${fids.length} findings as ${action}?`)) return;
+  let ok = 0, fail = 0;
+  for (const fid of fids) {
+    try {
+      if (action === "delete") {
+        await api(`/findings/${encodeURIComponent(fid)}`, { method: "DELETE" });
+      } else {
+        await api(`/findings/${encodeURIComponent(fid)}`, {
+          method: "PUT", body: JSON.stringify({ status: action }),
+        });
+      }
+      ok++;
+    } catch { fail++; }
+  }
+  if (action === "delete") toast(`Deleted ${ok} finding${ok !== 1 ? "s" : ""}.`);
+  else toast(`Marked ${ok} findings as ${action}.${fail ? ` (${fail} failed)` : ""}`, fail > 0 && fail === ok);
   await refreshFindings();
 }
 
 /* ── route: settings ───────────────────────────────────────────────── */
 
 async function pageSettings() {
-  setPageMeta({ crumb: "Settings", title: "Settings", subtitle: "Server runtime configuration (read-only)" });
+  setPageMeta({ crumb: "Settings", title: "Settings", subtitle: "Server runtime configuration from config.py (MCP_* env vars).",
+    actions: [{ label: "⟳ Refresh config", cls: "ghost", fn: () => { pageSettings().catch(() => {}); } }] });
   const s = await api("/server");
   $("#pageHeadInfo").innerHTML = `
     <div class="eyebrow">SETTINGS</div><h1>Server</h1>
@@ -3215,7 +4286,14 @@ async function pageSettings() {
           Default timeout: <strong>${esc(s.default_timeout)}s</strong><br/>
           Max timeout: <strong>${esc(s.max_timeout)}s</strong><br/>
           Max concurrent operations: <strong>${esc(s.max_concurrent)}</strong><br/>
-          Debug mode: <strong>${s.debug ? "on" : "off"}</strong></div></div>
+          Debug mode:
+          <label class="checkline" style="margin:0 0 0 8px;display:inline-block">
+            <input type="checkbox" id="debugToggle" ${s.debug ? "checked" : ""}>
+            <span id="debugToggleLabel">${s.debug ? "on" : "off"}</span>
+          </label>
+          ${s.uptime_seconds != null ? `<br/>Server uptime: <strong>${fmtUptime(s.uptime_seconds)}</strong>` : ""}
+          ${s.active_executions != null ? `<br/>Active executions: <strong>${esc(String(s.active_executions))}</strong>` : ""}
+          ${s.total_requests != null ? `<br/>Total requests: <strong>${esc(String(s.total_requests))}</strong>` : ""}</div></div>
       <div class="panel"><div class="panel-head"><span>Token</span></div>
         <div style="padding:12px;font-size:12px;line-height:1.8">
           ${s.auth_enabled
@@ -3229,6 +4307,23 @@ async function pageSettings() {
     toast("Stored token cleared");
     refreshAuthBadge();
   });
+  const debugToggle = $("#debugToggle");
+  if (debugToggle) {
+    debugToggle.addEventListener("change", async (e) => {
+      const el = e.target;
+      el.disabled = true;
+      try {
+        await api("/server/debug", { method: "PUT", body: JSON.stringify({ debug: el.checked }) });
+        $("#debugToggleLabel").textContent = el.checked ? "on" : "off";
+        toast(`Debug mode ${el.checked ? "on" : "off"}`);
+      } catch (err) {
+        el.checked = !el.checked;
+        toast(err.message, true);
+      } finally {
+        el.disabled = false;
+      }
+    });
+  }
 }
 
 /* ── auth badge ────────────────────────────────────────────────────── */
@@ -3267,6 +4362,7 @@ function parseHash() {
 
 async function route() {
   if (execTimer) { clearInterval(execTimer); execTimer = null; }
+  if (findingsTimer) { clearInterval(findingsTimer); findingsTimer = null; }
   if (runStatusTimer) { clearInterval(runStatusTimer); runStatusTimer = null; }
   if (execDetailTimer) { clearInterval(execDetailTimer); execDetailTimer = null; }
   // persist any unsaved inspector edits when leaving the editor page
@@ -3288,6 +4384,55 @@ async function route() {
   } catch (err) {
     $("#pageBody").insertAdjacentHTML("beforeend", `<p class="error" style="padding:20px">${esc(err.message)}</p>`);
   }
+}
+
+/* ── keyboard shortcuts ──────────────────────────────────────────────
+ * ?: show/hide a keyboard-help panel
+ * Ctrl/Cmd + K: focus the current page's search input
+ * Escape: close any open modal (run, playbook create, finder detail, token…)
+ * Escape also dismisses the help panel.
+ */
+let keyHelpOpen = false;
+
+function focusSearch() {
+  const sel = ["#pbSearch", "#toolSearch", "#fndTarget", "#fndTool"];
+  const el = sel.map((s) => $(s)).find((e) => e && !e.hidden && e.offsetParent !== null);
+  if (el) {
+    el.focus();
+    try { el.select(); } catch { } // select text in text inputs
+  }
+}
+
+function toggleKeyHelp() {
+  keyHelpOpen = !keyHelpOpen;
+  let el = $("#keyHelp");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "keyHelp";
+    el.innerHTML = `
+      <div class="panel" style="position:fixed;top:110px;left:50%;transform:translateX(-50%);min-width:280px;max-width:92vw;width:430px;padding:22px 26px;z-index:260">
+        <h3 style="margin:0 0 10px">Keyboard shortcuts</h3>
+        <div style="display:grid;gap:6px;font-size:12.5px;color:var(--muted)">
+          <div><b>?</b> Show this help</div>
+          <div><b>Ctrl/Cmd + K</b> Focus search</div>
+          <div><b>Escape</b> Close open modals</div>
+          <div><b>Ctrl/Cmd + Z</b> Undo · <b>Ctrl/Cmd + Y</b> Redo (graph &amp; DSL)</div>
+          <div><b>Delete / Backspace</b> Delete selected graph node</div>
+        </div>
+        <button class="btn primary" id="keyHelpClose" style="margin-top:12px">Got it</button>
+      </div>`;
+    document.body.appendChild(el);
+    el.querySelector("#keyHelpClose").addEventListener("click", toggleKeyHelp);
+  }
+  el.hidden = !keyHelpOpen;
+  if (keyHelpOpen) el.querySelector("#keyHelpClose")?.focus();
+}
+
+function closeOpenModals() {
+  const open = $$(".modal-backdrop.show");
+  if (open.length) { open[open.length - 1].remove(); return true; }
+  if (keyHelpOpen) { toggleKeyHelp(); return true; }
+  return false;
 }
 
 function bootShell() {
@@ -3357,6 +4502,20 @@ function bootShell() {
   });
   bubble.addEventListener("mouseenter", () => { clearTimeout(hoverTimer); });
   bubble.addEventListener("mouseleave", () => { hideTip(); });
+
+  /* Global keyboard shortcuts. */
+  document.addEventListener("keydown", (e) => {
+    const active = document.activeElement;
+    const typing = active && (active.tagName === "INPUT" || active.tagName === "TEXTAREA"
+      || active.isContentEditable);
+    if (e.key === "Escape") { closeOpenModals(); return; }
+    if (typing) return;
+    if (e.key === "?") { e.preventDefault(); toggleKeyHelp(); }
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "k") {
+      e.preventDefault();
+      focusSearch();
+    }
+  });
 }
 
 (() => {
