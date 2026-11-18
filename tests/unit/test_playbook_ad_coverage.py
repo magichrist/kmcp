@@ -149,9 +149,7 @@ class TestExecute:
         tool = PlaybookAdTool()
         fake_result = _FakeResult()
         with (
-            patch(
-                "kmcp.workflow.load_playbook", return_value={"name": "playbook_ad"}
-            ) as mock_load,
+            patch("kmcp.workflow.load_playbook", return_value={"name": "playbook_ad"}) as mock_load,
             patch(
                 "kmcp.workflow.run_playbook_async",
                 new=AsyncMock(return_value=fake_result),

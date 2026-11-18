@@ -131,8 +131,7 @@ def check_scope(
         and not any(_matches_pattern(target, p) for p in scope.allowed_targets)
     ):
         raise ValueError(
-            f"target '{target}' is not in allowed scope targets: "
-            f"{', '.join(scope.allowed_targets)}"
+            f"target '{target}' is not in allowed scope targets: {', '.join(scope.allowed_targets)}"
         )
 
     # Check allowed operations (if any are configured, tool must be in list)

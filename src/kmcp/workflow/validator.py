@@ -1082,7 +1082,9 @@ def _check_reference(
         if spec is None:
             hint = _suggestion(input_name, set(context.input_specs))
             findings.append(
-                _finding("error", consumer, field, f"reference to undeclared input {input_name!r}{hint}")
+                _finding(
+                    "error", consumer, field, f"reference to undeclared input {input_name!r}{hint}"
+                )
             )
             return
         if fields:

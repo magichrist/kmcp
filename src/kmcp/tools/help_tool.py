@@ -140,9 +140,7 @@ class KmcpHelpTool(BaseTool):
             scored: list[tuple[float, BaseTool]] = []
             for t in tools:
                 name_low = t.name.lower()
-                hay = " ".join(
-                    [name_low, *registry.aliases_for(t.name), t.description.lower()]
-                )
+                hay = " ".join([name_low, *registry.aliases_for(t.name), t.description.lower()])
                 name_score = difflib.SequenceMatcher(None, query, name_low).ratio()
                 if query in hay:
                     scored.append((1.0 + name_score, t))
@@ -156,8 +154,7 @@ class KmcpHelpTool(BaseTool):
                     "query": query,
                     "total_tools": len(tools),
                     "matches": matches,
-                    "hint": "Re-call with {'tool': '<name>'} for full "
-                    "schema + example arguments.",
+                    "hint": "Re-call with {'tool': '<name>'} for full schema + example arguments.",
                 },
             )
 

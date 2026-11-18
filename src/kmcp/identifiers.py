@@ -16,9 +16,7 @@ from typing import Any
 _assessment_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "kmcp_assessment_id", default=None
 )
-_job_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "kmcp_job_id", default=None
-)
+_job_ctx: contextvars.ContextVar[str | None] = contextvars.ContextVar("kmcp_job_id", default=None)
 
 
 def generate_assessment_id() -> str:

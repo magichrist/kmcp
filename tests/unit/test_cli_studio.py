@@ -159,17 +159,15 @@ class TestIsLanIp:
         # Reserved 240.0.0.0/4 — reported by UDP-route detection on machines
         # with virtual/VPN tunnel interfaces; unroutable locally.
         assert not _is_lan_ip("240.0.0.2")
-        assert not _is_lan_ip("127.0.0.1")       # loopback
-        assert not _is_lan_ip("169.254.3.2")     # link-local
-        assert not _is_lan_ip("224.0.0.5")       # multicast
-        assert not _is_lan_ip("8.8.8.8")         # public
+        assert not _is_lan_ip("127.0.0.1")  # loopback
+        assert not _is_lan_ip("169.254.3.2")  # link-local
+        assert not _is_lan_ip("224.0.0.5")  # multicast
+        assert not _is_lan_ip("8.8.8.8")  # public
         assert not _is_lan_ip("not-an-ip")
 
 
 class TestBrowserOpenBehaviour:
-    def test_cmd_studio_prints_manual_hint_when_browser_raises(
-        self, monkeypatch, capsys
-    ) -> None:
+    def test_cmd_studio_prints_manual_hint_when_browser_raises(self, monkeypatch, capsys) -> None:
         monkeypatch.setenv("MCP_PORT", "8399")
         monkeypatch.delenv("STUDIO_PORT", raising=False)
         monkeypatch.setenv("KALI_MCP_INSECURE", "1")

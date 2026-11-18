@@ -48,7 +48,9 @@ def _make_error(tool_name: str, error: str, details: str | None = None) -> dict[
     return error_response(ToolError(error=f"{tool_name}: {error}", details=details))
 
 
-def _validate_definition(playbook_id: str, definition: dict[str, Any], for_publish: bool) -> dict[str, Any]:
+def _validate_definition(
+    playbook_id: str, definition: dict[str, Any], for_publish: bool
+) -> dict[str, Any]:
     """Run studio playbook validation; returns ``{"valid": ..., "findings": [...]}``."""
     from kmcp.studio import playbook_service
 
@@ -256,9 +258,7 @@ class PlaybookValidateTool(BaseTool):
         playbook_id = arguments["playbook_id"].strip()
         for_publish = bool(arguments.get("for_publish", True))
 
-        validation = _validate_definition(
-            playbook_id, dict(definition), for_publish=for_publish
-        )
+        validation = _validate_definition(playbook_id, dict(definition), for_publish=for_publish)
 
         payload: dict[str, Any] = {
             "valid": validation["valid"],

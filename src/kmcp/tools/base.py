@@ -300,9 +300,7 @@ class BaseTool(abc.ABC):
             if name in required:
                 continue
             if "default" in prop:
-                parts.append(
-                    f"omit '{name}' to use default {prop['default']!r}"
-                )
+                parts.append(f"omit '{name}' to use default {prop['default']!r}")
         return "; ".join(parts)
 
     def _augment_validation_error(

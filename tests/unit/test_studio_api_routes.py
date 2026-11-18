@@ -112,7 +112,9 @@ def test_put_server_debug_toggle_roundtrip(client):
 
 
 def test_put_server_debug_invalid_json(client):
-    r = client.put("/api/server/debug", content=b"not-json", headers={"Content-Type": "application/json"})
+    r = client.put(
+        "/api/server/debug", content=b"not-json", headers={"Content-Type": "application/json"}
+    )
     assert r.status_code == 400
 
 
@@ -177,4 +179,3 @@ def test_run_tool_passes_empty_args_and_404s(client, monkeypatch):
 
     r = client.post("/api/tools/nuclei/run", json={"args": [1, 2]})  # args must be an object
     assert r.status_code == 400
-

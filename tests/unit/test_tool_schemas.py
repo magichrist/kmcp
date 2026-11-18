@@ -157,7 +157,10 @@ VALID_ARGS = {
     "playbook_catalog": {},
     "playbook_result": {"job_id": "job_test123"},
     "playbook_create": {"playbook_id": "quick_http_probe", "name": "Quick HTTP Probe"},
-    "playbook_validate": {"playbook_id": "quick_http_probe", "definition": {"name": "quick_http_probe"}},
+    "playbook_validate": {
+        "playbook_id": "quick_http_probe",
+        "definition": {"name": "quick_http_probe"},
+    },
     "playbook_publish": {
         "playbook_id": "quick_http_probe",
         "version": "1.0",

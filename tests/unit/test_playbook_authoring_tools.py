@@ -108,13 +108,9 @@ class TestPlaybookCreateTool:
         fake_db = MagicMock()
         row = {"playbook_id": "pb1", "name": "PB 1", "status": "draft"}
         with (
-            patch(
-                "kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db
-            ),
+            patch("kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db),
             patch("kmcp.studio.playbook_service.get_playbook", return_value=None),
-            patch(
-                "kmcp.studio.playbook_service.create_playbook", return_value=row
-            ) as create,
+            patch("kmcp.studio.playbook_service.create_playbook", return_value=row) as create,
         ):
             response = await tool.execute(
                 {"playbook_id": "pb1", "name": "PB 1", "category": "recon"}
@@ -132,9 +128,7 @@ class TestPlaybookCreateTool:
         tool = PlaybookCreateTool()
         fake_db = MagicMock()
         with (
-            patch(
-                "kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db
-            ),
+            patch("kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db),
             patch(
                 "kmcp.studio.playbook_service.get_playbook",
                 return_value={"playbook_id": "pb1", "status": "published"},
@@ -158,9 +152,7 @@ class TestPlaybookCreateTool:
         tool = PlaybookCreateTool()
         fake_db = MagicMock()
         with (
-            patch(
-                "kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db
-            ),
+            patch("kmcp.tools.playbook_authoring.db_manager.get_db", return_value=fake_db),
             patch("kmcp.studio.playbook_service.get_playbook", return_value=None),
             patch(
                 "kmcp.studio.playbook_service.create_playbook",
@@ -207,9 +199,7 @@ class TestPlaybookValidateTool:
             {"severity": "error", "step_id": "a", "field": "id", "message": "duplicate step id"},
         ]
         validation = {"valid": False, "findings": findings}
-        with patch(
-            "kmcp.tools.playbook_authoring._validate_definition", return_value=validation
-        ):
+        with patch("kmcp.tools.playbook_authoring._validate_definition", return_value=validation):
             response = await tool.execute(
                 {"playbook_id": "pb1", "definition": dict(INVALID_DEFINITION)}
             )
@@ -302,9 +292,7 @@ class TestPlaybookPublishTool:
                 "kmcp.studio.playbook_service.validate_definition",
                 return_value={"valid": True, "findings": []},
             ),
-            patch(
-                "kmcp.studio.playbook_service.publish_version", return_value=42
-            ) as publish,
+            patch("kmcp.studio.playbook_service.publish_version", return_value=42) as publish,
         ):
             response = await tool.execute(
                 {

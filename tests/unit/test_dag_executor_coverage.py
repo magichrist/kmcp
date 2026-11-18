@@ -698,9 +698,9 @@ class TestRunStepAndExecuteSingleStep:
                 new=MagicMock(side_effect=ScopeViolationError("out of scope")),
             ),
             patch("kmcp.db.manager.get_db", return_value=None),
+            pytest.raises(ScopeViolationError),
         ):
-            with pytest.raises(ScopeViolationError):
-                await engine._execute_single_step(_step(id="s", tool="nmap", args={}), {})
+            await engine._execute_single_step(_step(id="s", tool="nmap", args={}), {})
 
     async def test_run_tool_step_output_mapping(self):
         _clear_run_status()
@@ -898,9 +898,7 @@ class TestForeach:
                 raise ScopeViolationError("evil.com not allowed")
 
         with (
-            patch(
-                "kmcp.workflow.dag_executor.gate_step_args", new=MagicMock(side_effect=_gate)
-            ),
+            patch("kmcp.workflow.dag_executor.gate_step_args", new=MagicMock(side_effect=_gate)),
             patch.object(engine, "_execute_single_step", _exec),
         ):
             res = await engine._run_foreach(

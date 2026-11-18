@@ -493,6 +493,7 @@ async def run_tool_with_persistence(
         "findings": findings,
         "credentials": credentials,
     }
+
     # Do NOT pre-serialize data["stdout"] into json.dumps(payload) — that
     # double-encodes stdout (once here, again in success_response). Leave
     # stdout as-is and surface the metadata at the top level, serialized

@@ -157,8 +157,10 @@ async def put_definition_publish(request: Request) -> JSONResponse:
 
     if not approvals.is_approved(db, approvals.GATE_PUBLISH, playbook_id):
         return JSONResponse(
-            {"error": approvals.require_approval_for(approvals.GATE_PUBLISH)
-             + " Create an approval request first, then retry."},
+            {
+                "error": approvals.require_approval_for(approvals.GATE_PUBLISH)
+                + " Create an approval request first, then retry."
+            },
             status_code=403,
         )
 
@@ -316,7 +318,9 @@ async def create_playbook_api(request: Request) -> JSONResponse:
 
     try:
         row = playbook_service.create_playbook(
-            db, playbook_id, name,
+            db,
+            playbook_id,
+            name,
             description=body.get("description"),
             category=body.get("category", "custom"),
         )
@@ -454,7 +458,13 @@ async def server_info(request: Request) -> JSONResponse:
     }
     health = _server_health()
     if health:
-        for key in ("uptime_seconds", "active_executions", "total_requests", "total_errors", "memory_mb"):
+        for key in (
+            "uptime_seconds",
+            "active_executions",
+            "total_requests",
+            "total_errors",
+            "memory_mb",
+        ):
             if health.get(key) is not None:
                 info[key] = health[key]
     return JSONResponse(info)
@@ -567,7 +577,9 @@ async def put_connection_api(request: Request) -> JSONResponse:
         return JSONResponse({"error": "database unavailable"}, status_code=500)
     connection_id = request.path_params["id"]
     cur = db.conn.cursor()
-    row = cur.execute("SELECT * FROM mcp_connections WHERE connection_id = ?", (connection_id,)).fetchone()
+    row = cur.execute(
+        "SELECT * FROM mcp_connections WHERE connection_id = ?", (connection_id,)
+    ).fetchone()
     if row is None:
         return JSONResponse({"error": "connection not found"}, status_code=404)
     existing = dict(row)

@@ -72,16 +72,12 @@ class TestCoerceValue:
 
 class TestNormalizeArguments:
     def test_camel_case_keys_mapped_to_schema(self):
-        out = _normalize_arguments(
-            {"scanType": "-sV", "timeout": "60"}, STRING_SCHEMA
-        )
+        out = _normalize_arguments({"scanType": "-sV", "timeout": "60"}, STRING_SCHEMA)
         assert out["scan_type"] == "-sV"
         assert out["timeout"] == 60
 
     def test_string_values_not_corrupted(self):
-        out = _normalize_arguments(
-            {"name": "3", "tags": "true"}, STRING_SCHEMA
-        )
+        out = _normalize_arguments({"name": "3", "tags": "true"}, STRING_SCHEMA)
         assert out["name"] == "3"
         assert out["tags"] == "true"
 
