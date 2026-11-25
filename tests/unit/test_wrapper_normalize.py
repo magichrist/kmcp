@@ -177,6 +177,12 @@ def test_parser_tools_execute_contract(tool_name, tmp_path, monkeypatch):
         return _FakeResult(stdout)
 
     monkeypatch.setattr(execution.engine, "execute", fake_execute)
+    # hashcat has a binary preflight (F-08); execution is mocked here, so the
+    # host's binary availability is irrelevant to this parser/persistence test.
+    if tool_name == "hashcat":
+        monkeypatch.setattr(
+            "kmcp.tools.hashcat.shutil.which", lambda _binary: "/usr/bin/hashcat"
+        )
     result = _run(tool.safe_execute(args))
 
     assert result["isError"] is False
