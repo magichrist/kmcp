@@ -19,14 +19,15 @@ shell expressions.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
 from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 from kmcp.models import ExecutionResult
-from kmcp.tools.persist import now_iso
 from kmcp.workflow import modules_runtime
 from kmcp.workflow.scope_gate import ScopeViolationError, gate_step_args
 from kmcp.workflow.yaml_loader import (
@@ -42,6 +43,15 @@ def _get_registry():
     from kmcp.registry import registry
 
     return registry
+
+
+def now_iso() -> str:
+    """UTC ISO-8601 timestamp (local equivalent of ``tools.persist.now_iso``).
+
+    Defined locally so importing ``kmcp.workflow`` never pulls in
+    ``kmcp.tools`` at module load time (circular import BUG-062).
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _has_placeholder(command: str, name: str) -> bool:
@@ -136,12 +146,17 @@ class PlaybookEngine:
                 if db is not None:
                     persisted = db.load_workflow_run(name)
                     if persisted:
-                        prior = dict(persisted.get("state") or {})
-                        prior["status"] = persisted.get("status", prior.get("status"))
-                        prior["completed_steps"] = persisted.get(
-                            "completed_steps", prior.get("completed_steps", [])
-                        )
-                        RUN_STATUS[name] = prior
+                        restored = dict(persisted.get("state") or {})
+                        # Only checkpointed runs are resumable across process
+                        # restarts; a plain final-status row is informational.
+                        legacy = "succeeded_steps" not in restored
+                        if legacy or restored.get("checkpointed"):
+                            restored["status"] = persisted.get("status", restored.get("status"))
+                            restored["completed_steps"] = persisted.get(
+                                "completed_steps", restored.get("completed_steps", [])
+                            )
+                            prior = restored
+                            RUN_STATUS[name] = prior
             except Exception:  # noqa: BLE001 — SQLite resume is best-effort
                 pass
         if (
@@ -149,7 +164,12 @@ class PlaybookEngine:
             and prior
             and prior.get("status") in ("completed", "failed", "aborted", "partial")
         ):
-            skip_indices = set(prior.get("completed_steps", []))
+            # Only steps that actually succeeded are resumable. Older state
+            # dicts only carried ``completed_steps``; honour that legacy view
+            # unless the run explicitly recorded failed/skipped indices.
+            skip_indices = set(prior.get("succeeded_steps", prior.get("completed_steps", [])))
+            skip_indices.difference_update(prior.get("skipped_steps", []))
+            skip_indices.difference_update(prior.get("failed_steps", []))
 
         state = RUN_STATUS.setdefault(name, {})
         state.update(
@@ -161,12 +181,18 @@ class PlaybookEngine:
                 "timeout": playbook.timeout,
             }
         )
-        if resume:
-            state["completed_steps"] = sorted(skip_indices)
-        else:
-            state["completed_steps"] = []
+        # Keep attempted / succeeded / skipped / failed bookkeeping distinct:
+        # only succeeded steps may be skipped on resume (BUG-009).
+        state["completed_steps"] = sorted(skip_indices)
+        state["succeeded_steps"] = sorted(skip_indices)
+        state["attempted_steps"] = []
+        state["skipped_steps"] = []
+        state["failed_steps"] = []
+        state["checkpointed"] = False
 
-        # Substitute {{target}} into step args
+        # Work on per-run copies so placeholder substitution can never mutate
+        # the authored playbook definition shared by later runs (BUG-013).
+        steps = [copy.deepcopy(step) for step in playbook.steps]
         if subst_target:
             for step in steps:
                 step.args = self._substitute_target(step.args, subst_target)
@@ -174,16 +200,34 @@ class PlaybookEngine:
         sem = asyncio.Semaphore(playbook.max_parallel)
         budget_default = max(30, playbook.timeout // max(1, len(steps)))
 
+        aborted_flag = {"value": False}
+        #: ids of steps that failed with ``skip_dependents`` — only their
+        #: transitive dependents may be skipped (BUG-033).
+        skip_dependents_ids: set[str] = set()
+        terminal_indices: set[int] = set(skip_indices)
+
+        def mark(idx: int, *, succeeded=False, attempted=False, skipped=False, failed=False):
+            terminal_indices.add(idx)
+            buckets = (
+                (state["succeeded_steps"], succeeded),
+                (state["attempted_steps"], attempted),
+                (state["skipped_steps"], skipped),
+                (state["failed_steps"], failed),
+            )
+            for bucket, enabled in buckets:
+                if enabled and idx not in bucket:
+                    bucket.append(idx)
+            if succeeded and idx not in state["completed_steps"]:
+                state["completed_steps"].append(idx)
+
         async def run_one(idx: int) -> tuple[int, Any]:
             step = steps[idx]
             if idx in skip_indices:
                 return idx, {"step": step.id, "skipped": True, "reason": "resume skip"}
-            if (
-                aborted_flag["value"]
-                and step.on_failure == "abort"
-                and self._depends_on_failed(step, steps, idx)
-            ):
+            if aborted_flag["value"]:
                 return idx, {"step": step.id, "skipped": True, "reason": "aborted"}
+            if skip_dependents_ids and self._depends_on_any(step, steps, skip_dependents_ids):
+                return idx, {"step": step.id, "skipped": True, "reason": "skipped_dependents"}
             step_budget = int((step.budget or {}).get("timeout", budget_default))
             async with sem:
                 try:
@@ -196,8 +240,6 @@ class PlaybookEngine:
                 except Exception as e:  # noqa: BLE001
                     return idx, {"step": step.id, "error": str(e)}
 
-        aborted_flag = {"value": False}
-
         # Results collected in wave order; used for the ExecutionResult payload.
         results: list[Any] = []
 
@@ -207,13 +249,6 @@ class PlaybookEngine:
         overall_deadline = asyncio.get_event_loop().time() + playbook.timeout
 
         for wave in waves:
-            if aborted_flag["value"]:
-                # skip remaining waves' dependent steps handled per-step
-                for idx in wave:
-                    if idx not in state["completed_steps"]:
-                        state["completed_steps"].append(idx)
-                continue
-            # filter skipped
             todo = [idx for idx in wave if idx not in skip_indices]
             if not todo:
                 continue
@@ -222,44 +257,57 @@ class PlaybookEngine:
             if remaining <= 0:
                 state["status"] = "failed"
                 aborted_flag["value"] = True
+                for idx in todo:
+                    if idx not in state["skipped_steps"]:
+                        state["skipped_steps"].append(idx)
                 break
 
             wave_results = await asyncio.gather(*[run_one(idx) for idx in todo])
 
             for idx, step_res in wave_results:
                 step = steps[idx]
+                skipped_reason = (
+                    step_res.get("reason")
+                    if isinstance(step_res, dict) and step_res.get("skipped")
+                    else None
+                )
+                if skipped_reason in ("aborted", "skipped_dependents"):
+                    # Never report a step that did not run as a step result.
+                    mark(idx, skipped=True)
+                    continue
+
                 if isinstance(step_res, list):
                     results.extend(step_res)
                 else:
                     results.append(step_res)
                 self._step_results[step.id] = step_res
-                if idx not in state["completed_steps"]:
-                    state["completed_steps"].append(idx)
 
-                if step.checkpoint:
-                    self._persist_state(name, state)
-
-                step_failed = self._is_step_failure(step_res)
-                if step_failed:
+                if self._is_step_failure(step_res):
+                    mark(idx, attempted=True, failed=True)
                     if step.on_failure == "abort":
                         aborted_flag["value"] = True
                         state["status"] = "failed"
                     elif step.on_failure == "skip_dependents":
-                        aborted_flag["value"] = True
+                        skip_dependents_ids.add(step.id)
+                elif skipped_reason:
+                    # A false ``when`` (or a resume skip) is not a failure.
+                    mark(idx, succeeded=True)
+                else:
+                    mark(idx, attempted=True, succeeded=True)
 
-        # handle skipped indices
-        for idx in skip_indices:
-            if idx not in state["completed_steps"]:
-                state["completed_steps"].append(idx)
+                if step.checkpoint:
+                    state["checkpointed"] = True
+                    self._persist_state(name, state, checkpoint=True)
 
-        all_completed = len(state["completed_steps"]) == len(steps)
+        all_completed = len(terminal_indices) == len(steps)
         final_status = (
             "completed"
-            if (all_completed and not aborted_flag["value"])
-            else ("partial" if state["completed_steps"] else "failed")
+            if (all_completed and not aborted_flag["value"] and not state["failed_steps"])
+            else ("partial" if terminal_indices else "failed")
         )
         state["status"] = final_status
         state["finished_at"] = now_iso()
+        state["completed_steps"] = sorted(state["completed_steps"])
 
         payload = {
             "playbook": name,
@@ -267,8 +315,15 @@ class PlaybookEngine:
             "results": results,
             "status": state["status"],
             "completed_steps": state["completed_steps"],
+            "succeeded_steps": state["succeeded_steps"],
+            "attempted_steps": state["attempted_steps"],
+            "skipped_steps": state["skipped_steps"],
+            "failed_steps": state["failed_steps"],
             "step_results": {k: v for k, v in self._step_results.items()},
         }
+
+        # Persist the final status (BUG-010) so resume sees the real outcome.
+        self._persist_state(name, state)
 
         return ExecutionResult(
             tool=name,
@@ -314,19 +369,22 @@ class PlaybookEngine:
 
     async def _execute_single_step(self, step: StepDefinition, state: dict) -> Any:
         """Execute one step based on its type."""
-        # Server-side scope check on every target-looking arg, before ANY
-        # step type executes (security architecture: the engine independently
-        # enforces policy regardless of UI visibility or author intent).
+        # Build the *final* args (module defaults + step args + output_mapping)
+        # before the scope gate: mapped/discovered targets must be checked too
+        # (BUG-034). The same dict is handed to the tool runner, so there is a
+        # single source of truth for what actually executes.
         tool_name = step.tool
-        args_for_gate = step.args
+        mod = None
         if step.module and not tool_name:
             mod = load_module(step.module)
             if mod is not None:
                 tool_name = mod.get("tool")
-                args_for_gate = self._merge_module_args(step, mod)
-        gate_step_args(args_for_gate, step_id=step.id, tool_name=tool_name)
+        args = self._prepare_args(step, mod)
+        gate_step_args(args, step_id=step.id, tool_name=tool_name)
 
         if step.module:
+            # Keep the two-argument runner contract for overrides/subclasses;
+            # it recomputes the same final args via _prepare_args.
             return await self._run_module_step(step, state)
         if step.type == "shell":
             return await self._run_shell_step(step, state)
@@ -342,7 +400,23 @@ class PlaybookEngine:
             return await self._run_custom_step(step, state)
         raise PlaybookError(f"Unknown step type: {step.type}")
 
-    async def _run_tool_step(self, step: StepDefinition, state: dict) -> Any:
+    def _prepare_args(
+        self, step: StepDefinition, mod: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Assemble the final args for a step, applying output_mapping."""
+        if mod is not None and step.module and not step.tool:
+            args = self._merge_module_args(step, mod)
+        else:
+            args = copy.deepcopy(step.args) if isinstance(step.args, dict) else {}
+        for out_key, src_ref in (step.output_mapping or {}).items():
+            value = self._resolve_ref(src_ref)
+            if value is not None:
+                args[out_key] = copy.deepcopy(value)
+        return args
+
+    async def _run_tool_step(
+        self, step: StepDefinition, state: dict, args: dict[str, Any] | None = None
+    ) -> Any:
         """Invoke a registered native tool via the registry."""
         tool_name = step.tool
         if not tool_name:
@@ -351,13 +425,9 @@ class PlaybookEngine:
         if tool is None:
             return {"tool": tool_name, "error": "unknown tool", "step": step.id}
 
-        args = dict(step.args)
-        # Apply output_mapping: map prior step outputs into this step's args
-        for out_key, src_ref in step.output_mapping.items():
-            value = self._resolve_ref(src_ref)
-            if value is not None:
-                args[out_key] = value
-
+        if args is None:
+            # Direct callers still get output_mapping applied.
+            args = self._prepare_args(step)
         return await tool.safe_execute(args)
 
     # ── shell nodes ─────────────────────────────────────────────────────
@@ -574,10 +644,12 @@ class PlaybookEngine:
             else:
                 args[k] = v
         if isinstance(step.args, dict):
-            args.update(step.args)
+            args.update(copy.deepcopy(step.args))
         return args
 
-    async def _run_module_step(self, step: StepDefinition, state: dict) -> Any:
+    async def _run_module_step(
+        self, step: StepDefinition, state: dict, args: dict[str, Any] | None = None
+    ) -> Any:
         """Resolve an internal module declaration to a native tool and run it.
 
         Module definitions (``playbooks/modules/<cat>/<id>.yaml``) declare the
@@ -609,12 +681,9 @@ class PlaybookEngine:
                 "step": step.id,
             }
 
-        args = self._merge_module_args(step, mod)
-        # Apply output_mapping: map prior step outputs into this step's args
-        for out_key, src_ref in step.output_mapping.items():
-            value = self._resolve_ref(src_ref)
-            if value is not None:
-                args[out_key] = value
+        if args is None:
+            # Direct callers still get defaults + output_mapping applied.
+            args = self._prepare_args(step, mod)
 
         return await tool.safe_execute(args)
 
@@ -772,7 +841,7 @@ class PlaybookEngine:
                     )
                     continue
             # Create a per-iteration variant of the step with the item injected
-            iter_args = dict(step.args)
+            iter_args = copy.deepcopy(step.args)
             iter_args["_foreach_item"] = item
             iter_step = StepDefinition(
                 id=f"{step.id}_foreach",
@@ -860,14 +929,17 @@ class PlaybookEngine:
             waves.append(wave)
         return waves
 
-    def _substitute_target(self, args: dict[str, Any], target: Any) -> dict[str, Any]:
-        out: dict[str, Any] = {}
-        for k, v in args.items():
-            if isinstance(v, str):
-                out[k] = v.replace("{{target}}", str(target))
-            else:
-                out[k] = v
-        return out
+    def _substitute_target(self, value: Any, target: Any) -> Any:
+        """Replace ``{{target}}`` in every string leaf of a nested structure."""
+        if isinstance(value, str):
+            return value.replace("{{target}}", str(target))
+        if isinstance(value, dict):
+            return {k: self._substitute_target(v, target) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._substitute_target(v, target) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._substitute_target(v, target) for v in value)
+        return value
 
     def _evaluate_when(self, condition: str) -> bool:
         """Evaluate a when condition against structured step results.
@@ -908,13 +980,45 @@ class PlaybookEngine:
                 return float(value) >= float(compare_val)
             if op == "<=":
                 return float(value) <= float(compare_val)
-            if op == "==":
-                return str(value) == str(compare_val)
-            if op == "!=":
-                return str(value) != str(compare_val)
+            if op in ("==", "!="):
+                equal = self._values_equal(value, compare_val)
+                return equal if op == "==" else not equal
         except Exception:  # noqa: BLE001
             return False
         return False
+
+    @staticmethod
+    def _values_equal(left: Any, right: Any) -> bool:
+        """Compare two operands numerically / as booleans when applicable.
+
+        ``"0"`` is parsed to ``0.0`` by the condition parser; comparing that
+        with an integer ``0`` via ``str()`` always failed (BUG-012). Booleans
+        are normalised case-insensitively so ``true`` matches ``True``.
+        """
+
+        def as_number(value: Any) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str) and re.match(r"^-?\d+(?:\.\d+)?$", value.strip()):
+                return float(value.strip())
+            return None
+
+        def as_bool(value: Any) -> bool | None:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+                return value.strip().lower() == "true"
+            return None
+
+        left_num, right_num = as_number(left), as_number(right)
+        if left_num is not None and right_num is not None:
+            return left_num == right_num
+        left_bool, right_bool = as_bool(left), as_bool(right)
+        if left_bool is not None and right_bool is not None:
+            return left_bool == right_bool
+        return str(left) == str(right)
 
     def _unwrap_envelope(self, result: Any) -> Any:
         """Unwrap an MCP tool-response envelope into the inner ExecutionResult dict.
@@ -1022,10 +1126,38 @@ class PlaybookEngine:
         if isinstance(result, dict):
             if result.get("skipped"):
                 return False
-            if result.get("error"):
+            # Native tools return MCP envelopes such as
+            # {"content": [...], "isError": True}; inspect the envelope itself
+            # and the unwrapped payload before calling a step successful
+            # (BUG-011).
+            inner = self._unwrap_envelope(result)
+            payloads = [result, inner] if isinstance(inner, dict) else [result]
+            for payload in payloads:
+                if payload.get("isError") is True:
+                    return True
+                if payload.get("error"):
+                    return True
+                if payload.get("success") is False:
+                    return True
+        return False
+
+    def _depends_on_any(
+        self, step: StepDefinition, all_steps: list[StepDefinition], step_ids: set[str]
+    ) -> bool:
+        """True when any (direct or transitive) dependency is in ``step_ids``."""
+        id_to_index = {s.id: i for i, s in enumerate(all_steps)}
+        seen: set[str] = set()
+        queue: list[str] = list(step.depends_on)
+        while queue:
+            dep = queue.pop()
+            if dep in seen:
+                continue
+            seen.add(dep)
+            if dep in step_ids:
                 return True
-            if result.get("success") is False:
-                return True
+            idx = id_to_index.get(dep)
+            if idx is not None:
+                queue.extend(all_steps[idx].depends_on)
         return False
 
     def _depends_on_failed(
@@ -1040,10 +1172,22 @@ class PlaybookEngine:
                 return True
         return False
 
-    def _persist_state(self, name: str, state: dict, run_id: str | None = None) -> None:
+    def _persist_state(
+        self,
+        name: str,
+        state: dict,
+        run_id: str | None = None,
+        *,
+        checkpoint: bool = False,
+    ) -> None:
         """Persist playbook run state (best-effort) to RUN_STATUS and SQLite."""
+        if checkpoint:
+            state["checkpointed"] = True
         try:
-            RUN_STATUS[name] = dict(state)
+            # Mutate the live registry entry in place: callers hold references
+            # to it, and replacing it loses final status/finished_at (BUG-010).
+            entry = RUN_STATUS.setdefault(name, {})
+            entry.update(state)
         except Exception:  # noqa: BLE001
             pass
         try:
