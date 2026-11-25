@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -57,6 +58,97 @@ class LabTarget:
     target: str  # IP, domain, or URL
     expected_findings: list[GroundTruthFinding]
     allowed: bool = True  # in-scope by default
+
+
+# ── finding-title helpers ─────────────────────────────────────────────────
+
+
+def _normalize_title(value: str) -> str:
+    """Normalize a finding title: lowercase alphanumeric word tokens."""
+    return " ".join(re.findall(r"[a-z0-9]+", (value or "").lower()))
+
+
+def _normalize_asset(value: str | None) -> str:
+    """Reduce a target/asset/URL to a comparable host identifier."""
+    text = (value or "").strip().lower()
+    if "://" in text:
+        text = text.split("://", 1)[1]
+    return text.split("/", 1)[0].split(":", 1)[0]
+
+
+def _title_matches(ground_truth: GroundTruthFinding, finding: dict[str, Any]) -> bool:
+    """Compare a ground-truth finding with a generated finding.
+
+    Titles are matched after normalization (case/punctuation insensitive).
+    Asset and port act as compatibility gates when present on both sides, so
+    an identically titled finding on a different host/port is not a match.
+    """
+    if _normalize_title(ground_truth.title) != _normalize_title(finding.get("title", "")):
+        return False
+
+    gt_asset = _normalize_asset(ground_truth.asset)
+    found_asset = _normalize_asset(finding.get("asset") or finding.get("target"))
+    if gt_asset and found_asset and gt_asset != found_asset:
+        return False
+
+    found_port = finding.get("port")
+    if ground_truth.port is not None and found_port not in (None, "", 0):
+        try:
+            if int(found_port) != int(ground_truth.port):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
+def _extract_finding_titles(
+    text: str, ground_truth: list[GroundTruthFinding]
+) -> dict[str, dict[str, Any]]:
+    """Derive finding titles/metadata from parsed tool output text.
+
+    Known ground-truth titles are recognised directly in the output so the
+    simulated agent reports real finding names instead of a generic
+    placeholder. A few generic output signatures (open ports, SQL injection,
+    directory listing, outdated technology) cover output that does not spell
+    out the canonical title verbatim.
+    """
+    derived: dict[str, dict[str, Any]] = {}
+    normalized_text = _normalize_title(text)
+
+    for gt in ground_truth:
+        key = _normalize_title(gt.title)
+        if key and key in normalized_text:
+            derived[key] = {
+                "title": gt.title,
+                "port": gt.port,
+                "service": gt.service,
+                "source_tool": gt.source_tool,
+            }
+
+    for match in re.finditer(
+        r"\b(\d{1,5})/(?:tcp|udp)\s+open\s+([A-Za-z0-9_-]+)", text, re.IGNORECASE
+    ):
+        port, service = match.group(1), match.group(2)
+        title = f"Open {service.upper()} port {port}"
+        derived.setdefault(
+            _normalize_title(title),
+            {"title": title, "port": int(port), "service": service.lower()},
+        )
+
+    for pattern, title in (
+        (r"sql\s*(?:injection|vulnerability)", "SQL injection vulnerability"),
+        (r"directory\s+listing", "Directory listing enabled"),
+    ):
+        if re.search(pattern, text, re.IGNORECASE):
+            derived.setdefault(_normalize_title(title), {"title": title})
+
+    for match in re.finditer(
+        r"\boutdated\s+([A-Za-z0-9][A-Za-z0-9. -]{1,40})", text, re.IGNORECASE
+    ):
+        title = f"Outdated {match.group(1).strip().title()} version"
+        derived.setdefault(_normalize_title(title), {"title": title})
+
+    return derived
 
 
 # ── evaluation metrics ────────────────────────────────────────────────────
@@ -121,14 +213,38 @@ class AssessmentResult:
                 seen[key] = seen.get(key, 0) + 1
         self.duplicate_calls = sum(v - 1 for v in seen.values() if v > 1)
 
-        # Finding accuracy vs ground truth
+        # Finding accuracy vs ground truth. Match by normalized title with
+        # asset/port compatibility gates; each generated finding is consumed
+        # at most once so duplicate reports cannot inflate recall.
         if ground_truth:
-            found_titles = {f.get("title", "").lower() for f in self.findings}
-            expected_titles = {g.title.lower() for g in ground_truth}
+            used: set[int] = set()
+            true_positives = 0
+            for expected in ground_truth:
+                candidates = [
+                    i
+                    for i, found in enumerate(self.findings)
+                    if i not in used and _title_matches(expected, found)
+                ]
+                if not candidates:
+                    continue
+                # Prefer a finding produced by the tool expected to discover it.
+                expected_tool = _normalize_title(expected.source_tool or "")
+                chosen = candidates[0]
+                if expected_tool:
+                    for i in candidates:
+                        found = self.findings[i]
+                        tools = {_normalize_title(str(found.get("tool") or ""))}
+                        tools.update(
+                            _normalize_title(str(t)) for t in (found.get("source_tools") or [])
+                        )
+                        if expected_tool in tools:
+                            chosen = i
+                            break
+                used.add(chosen)
+                true_positives += 1
 
-            true_positives = len(found_titles & expected_titles)
-            false_positives = len(found_titles - expected_titles)
-            false_negatives = len(expected_titles - found_titles)
+            false_positives = len(self.findings) - true_positives
+            false_negatives = len(ground_truth) - true_positives
 
             self.precision = (
                 true_positives / (true_positives + false_positives)
@@ -329,13 +445,15 @@ class EvalHarness:
             completed=completed,
             error=error,
         )
-        self.result.compute_metrics(self.ground_truth)
-        # Real token counters (length/4 heuristic) — plan Task 14.1
+        # Real token counters (length/4 heuristic) — plan Task 14.1. Fill them
+        # *before* computing metrics: compute_metrics sums the per-call counters,
+        # so filling afterwards leaves every token/cost metric at zero.
         for c in calls:
             if not c.input_tokens:
                 c.input_tokens = max(1, len(json.dumps(c.arguments, default=str)) // 4)
             if not c.output_tokens:
                 c.output_tokens = max(1, c.input_tokens // 2)
+        self.result.compute_metrics(self.ground_truth)
         return self.result
 
     # ── v1 interface: native wrappers only ──────────────────────────
@@ -395,22 +513,37 @@ class EvalHarness:
                     )
                 )
                 if success:
-                    # Parse findings from result
+                    # Derive real finding titles from the parsed tool output
+                    # instead of a generic "{tool} finding" placeholder.
                     text = res.get("content", [{}])[0].get("text", "{}")
                     try:
                         data = json.loads(text)
-                        if isinstance(data, dict) and "stdout" in data:
-                            findings.append(
-                                {
-                                    "tool": tool_name,
-                                    "target": target,
-                                    "title": f"{tool_name} finding",
-                                    "severity": "informational",
-                                    "source_tools": [tool_name],
-                                }
-                            )
                     except json.JSONDecodeError:
-                        pass
+                        data = text
+                    if isinstance(data, dict):
+                        output = data.get("stdout")
+                        if output is None:
+                            output = data.get("output")
+                        if output is None:
+                            output = data.get("text")
+                        output_text = (
+                            str(output) if output is not None else json.dumps(data, default=str)
+                        )
+                    else:
+                        output_text = str(data)
+                    for meta in _extract_finding_titles(output_text, self.ground_truth).values():
+                        findings.append(
+                            {
+                                "tool": tool_name,
+                                "target": target,
+                                "asset": _normalize_asset(target),
+                                "title": meta["title"],
+                                "severity": "informational",
+                                "source_tools": [tool_name],
+                                "port": meta.get("port"),
+                                "service": meta.get("service"),
+                            }
+                        )
             except asyncio.TimeoutError:
                 duration = time.monotonic() - call_start
                 calls.append(
@@ -588,7 +721,7 @@ class EvalSuite:
         safe_target = result.target.replace("/", "_").replace(":", "_")
         filename = f"{result.interface}_{safe_model}_{safe_target}_{result.run_id}.json"
         path = self.output_dir / filename
-        path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+        path.write_text(json.dumps(asdict(result), indent=2), encoding="utf-8")
 
     def _write_aggregate_report(self, results: list[AssessmentResult]) -> None:
         """Write an aggregate comparison report."""
@@ -637,8 +770,10 @@ class EvalSuite:
         v2_configs = [k for k in groups if k.endswith("|v2")]
 
         if v1_configs and v2_configs:
-            v1 = groups[v1_configs[0]]
-            v2 = groups[v2_configs[0]]
+            # Aggregate every matching configuration group, not just the first
+            # one — the default matrix runs several models per interface.
+            v1 = [r for key in v1_configs for r in groups[key]]
+            v2 = [r for key in v2_configs for r in groups[key]]
             report["comparison"] = {
                 "calls_reduction_percent": round(
                     (
@@ -701,8 +836,10 @@ class EvalSuite:
         v2_keys = [k for k in groups if k.endswith("|v2")]
 
         if v1_keys and v2_keys:
-            v1 = groups[v1_keys[0]]
-            v2 = groups[v2_keys[0]]
+            # Include all v1/v2 model groups (paired by model) so success is
+            # judged across the whole matrix rather than one arbitrary model.
+            v1 = [r for key in v1_keys for r in groups[key]]
+            v2 = [r for key in v2_keys for r in groups[key]]
 
             v1_avg_calls = sum(r.mcp_calls for r in v1) / len(v1) if v1 else 0
             v2_avg_calls = sum(r.mcp_calls for r in v2) / len(v2) if v2 else 0
