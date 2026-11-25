@@ -1659,9 +1659,18 @@ class ToolCatalogTool(BaseTool):
             granted_names = {row["tool_id"] for row in rows}
             allowed &= granted_names
 
-        from kmcp.registry import registry
+        # Only tools explicitly demoted from agent_callable are hidden from
+        # the catalog. Tools without a registry definition stay visible
+        # (backwards compatible with runtime-only tools and test doubles).
+        from kmcp.registry import VISIBILITY_MODES, registry
 
-        tools = registry.list_all()
+        tools = []
+        for candidate in registry.list_all():
+            defn = registry.get_definition(candidate.name)
+            visibility = getattr(defn, "visibility", None) if defn is not None else None
+            if visibility in VISIBILITY_MODES and visibility != "agent_callable":
+                continue
+            tools.append(candidate)
 
         catalog: list[dict[str, Any]] = []
         for tool in tools:
