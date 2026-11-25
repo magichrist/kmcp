@@ -13,7 +13,9 @@ Executes playbook definitions as a DAG of internal modules. Supports:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import re
 from collections import deque
 from typing import Any
 
@@ -38,6 +40,34 @@ def _new_id(prefix: str) -> str:
     import uuid
 
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
+
+
+# Distinguishes a reference that could not be resolved from a reference that
+# legitimately resolved to ``None``. Callers handle unresolved refs explicitly
+# instead of silently treating them as falsey values.
+_UNRESOLVED = object()
+
+# ``{{target}}`` / ``{{inputs.options.ports}}`` / ``{{steps.foo.bar}}``
+_TOKEN_RE = re.compile(r"\{\{\s*([^{}]+?)\s*\}\}")
+
+
+def _token_inner(value: Any) -> str | None:
+    """Return the token name when ``value`` is exactly one ``{{...}}`` token."""
+    if not isinstance(value, str):
+        return None
+    match = _TOKEN_RE.fullmatch(value.strip())
+    return match.group(1).strip() if match else None
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``override`` over ``base`` recursively (used for playbook inputs)."""
+    merged = dict(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _get_tool_registry():
@@ -67,6 +97,8 @@ class PlaybookEngine:
         detail: str = "normal",
         assessment_id: str | None = None,
         job_id: str | None = None,
+        inputs: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run a playbook end-to-end and return a structured assessment dict."""
         pb_def = get_playbook(playbook_id)
@@ -82,6 +114,7 @@ class PlaybookEngine:
             scope_id=scope_id,
             profile=profile,
             detail=detail,
+            inputs=self._effective_inputs(pb_def, inputs, options, target),
         )
 
         # Build execution graph from playbook steps
@@ -188,6 +221,48 @@ class PlaybookEngine:
 
         return d
 
+    @staticmethod
+    def _effective_inputs(
+        pb_def: dict[str, Any],
+        supplied: dict[str, Any] | None,
+        options: dict[str, Any] | None,
+        target: str,
+    ) -> dict[str, Any]:
+        """Build the playbook inputs visible as ``{{inputs.*}}`` to steps.
+
+        Declared defaults (including nested ``properties`` defaults) are
+        seeded first, then caller-supplied ``inputs``/``options`` are merged
+        over them. ``target`` is always available as a plain input too.
+        """
+        resolved: dict[str, Any] = {}
+        for name, spec in (pb_def.get("inputs") or {}).items():
+            if not isinstance(spec, dict):
+                continue
+            if "default" in spec:
+                resolved[name] = copy.deepcopy(spec["default"])
+            nested_specs = spec.get("properties")
+            if isinstance(nested_specs, dict):
+                nested = {
+                    key: copy.deepcopy(value["default"])
+                    for key, value in nested_specs.items()
+                    if isinstance(value, dict) and "default" in value
+                }
+                if nested:
+                    existing = resolved.get(name)
+                    resolved[name] = _deep_merge(
+                        nested, existing if isinstance(existing, dict) else {}
+                    )
+
+        if isinstance(supplied, dict):
+            resolved = _deep_merge(resolved, supplied)
+        if isinstance(options, dict):
+            existing = resolved.get("options")
+            resolved["options"] = _deep_merge(
+                existing if isinstance(existing, dict) else {}, options
+            )
+        resolved["target"] = target
+        return resolved
+
     # ── module execution ──────────────────────────────────────────────
 
     async def _run_module(
@@ -244,18 +319,58 @@ class PlaybookEngine:
 
     # ── input resolution ──────────────────────────────────────────────
 
+    def _expand_placeholders(self, value: Any, ctx: AssessmentContext) -> Any:
+        """Recursively expand ``{{...}}`` tokens in step arguments.
+
+        A string that is exactly one token is replaced by the typed resolved
+        value (list/dict/number preserved); tokens embedded in a longer string
+        are substituted textually. Unresolvable tokens are left verbatim so a
+        bad reference is visible instead of silently becoming an empty value.
+        """
+        if isinstance(value, str):
+            matches = list(_TOKEN_RE.finditer(value))
+            if not matches:
+                return value
+            if len(matches) == 1 and matches[0].group(0) == value:
+                resolved = self._resolve_ref(matches[0].group(1).strip(), ctx)
+                if resolved is _UNRESOLVED:
+                    ctx.log("placeholders", f"unresolved reference: {value}", "debug")
+                    return value
+                return resolved
+
+            def replace(match: re.Match[str]) -> str:
+                resolved = self._resolve_ref(match.group(1).strip(), ctx)
+                if resolved is _UNRESOLVED:
+                    ctx.log("placeholders", f"unresolved reference: {match.group(0)}", "debug")
+                    return match.group(0)
+                return str(resolved)
+
+            return _TOKEN_RE.sub(replace, value)
+        if isinstance(value, dict):
+            return {key: self._expand_placeholders(item, ctx) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._expand_placeholders(item, ctx) for item in value]
+        return value
+
     def _resolve_inputs(
         self, mod_def: dict[str, Any], step: dict[str, Any], ctx: AssessmentContext
     ) -> dict[str, Any]:
         """Resolve module inputs from step args, context, and prior module outputs."""
-        inputs: dict[str, Any] = {}
+        raw: dict[str, Any] = {}
+        # Shipped playbooks use both styles: ``inputs:`` and ``args:``.
+        for source in ("args", "inputs"):
+            section = step.get(source)
+            if isinstance(section, dict):
+                raw.update(section)
 
-        for k, v in (step.get("inputs", {}) or {}).items():
-            inputs[k] = v
+        inputs = {key: self._expand_placeholders(value, ctx) for key, value in raw.items()}
 
         for out_key, src_ref in (step.get("output_mapping", {}) or {}).items():
-            value = self._resolve_ref(src_ref, ctx)
-            if value is not None:
+            # output_mapping accepts both plain refs (``res.hosts``) and
+            # placeholder-wrapped ones (``{{inputs.wordlist}}``).
+            token = _token_inner(src_ref)
+            value = self._resolve_ref(token if token is not None else src_ref, ctx)
+            if value is not _UNRESOLVED and value is not None:
                 inputs[out_key] = value
 
         if "target" not in inputs:
@@ -269,40 +384,74 @@ class PlaybookEngine:
         return inputs
 
     def _resolve_ref(self, ref: str, ctx: AssessmentContext) -> Any:
-        """Resolve a dotted reference like 'dns_intelligence.subdomains' against context."""
-        if not ref:
-            return None
-        parts = ref.split(".")
-        mod_result = ctx.get_module_result(parts[0])
-        if mod_result is None:
-            if parts[0] == "target":
-                mod_result = ctx.target
-            elif parts[0] == "assets":
-                mod_result = list(ctx.assets.values())
-            elif parts[0] == "findings":
-                mod_result = list(ctx.findings.values())
+        """Resolve a dotted reference against context.
+
+        Supports module results, ``target``, ``inputs.*``, ``steps.*``,
+        ``assets``, ``findings`` and the current ``item`` of a foreach loop.
+        Returns ``_UNRESOLVED`` (distinct from ``None``) when no value exists.
+        """
+        if not isinstance(ref, str) or not ref.strip():
+            return _UNRESOLVED
+        parts = ref.strip().split(".")
+        root = parts[0]
+
+        if root == "target":
+            value: Any = ctx.target
+            rest = parts[1:]
+        elif root == "inputs":
+            value = ctx.inputs
+            rest = parts[1:]
+        elif root == "item":
+            value = getattr(ctx, "_foreach_item", _UNRESOLVED)
+            rest = parts[1:]
+        elif root == "steps":
+            # ``steps.<step_id>.<field>`` — step ids normally match module ids.
+            if len(parts) < 2:
+                return _UNRESOLVED
+            value = ctx.get_module_result(parts[1])
+            rest = parts[2:]
+        elif root == "assets":
+            value = list(ctx.assets.values())
+            rest = parts[1:]
+        elif root == "findings":
+            value = list(ctx.findings.values())
+            rest = parts[1:]
+        else:
+            value = ctx.get_module_result(root)
+            if value is None and root in ctx.inputs:
+                # Bare input names are also valid (e.g. ``{{options.auth_token}}``).
+                value = ctx.inputs[root]
+            rest = parts[1:]
+            if value is None:
+                return _UNRESOLVED
+
+        if value is _UNRESOLVED or value is None:
+            return _UNRESOLVED
+
+        for part in rest:
+            if isinstance(value, dict):
+                if part not in value:
+                    return _UNRESOLVED
+                value = value[part]
+            elif isinstance(value, list):
+                value = [entry.get(part) if isinstance(entry, dict) else None for entry in value]
             else:
-                return None
-        for part in parts[1:]:
-            if isinstance(mod_result, dict):
-                mod_result = mod_result.get(part)
-            elif isinstance(mod_result, list):
-                mod_result = [
-                    item.get(part) if isinstance(item, dict) else None for item in mod_result
-                ]
-            else:
-                return None
-            if mod_result is None:
-                return None
-        return mod_result
+                return _UNRESOLVED
+            if value is None:
+                return _UNRESOLVED
+        return value
 
     def _resolve_foreach(self, ref: str, ctx: AssessmentContext) -> list[Any]:
         """Resolve a foreach reference to a list of items to iterate over."""
+        token = _token_inner(ref)
+        if token is not None:
+            ref = token
         value = self._resolve_ref(ref, ctx)
-        if isinstance(value, list):
-            return value
-        if value is None:
+        if value is _UNRESOLVED:
+            ctx.log("foreach", f"unresolved reference: {ref}", "debug")
             return []
+        if isinstance(value, (list, tuple)):
+            return list(value)
         return [value]
 
     def _inject_item(self, ctx: AssessmentContext, item: Any) -> None:
@@ -322,6 +471,8 @@ class PlaybookEngine:
             op = cond.get("op", "==")
             value = cond.get("value")
             actual = self._resolve_ref(field, ctx)
+            if actual is _UNRESOLVED:
+                ctx.log("condition", f"unresolved field reference: {field}", "debug")
             return self._compare(actual, op, value)
 
         if isinstance(cond, str):
@@ -331,15 +482,15 @@ class PlaybookEngine:
 
     def _eval_string_condition(self, cond: str, ctx: AssessmentContext) -> bool:
         """Parse simple string conditions: field op value."""
-        import re
-
-        m = re.match(r"(.+?)\s*(>=|<=|==|!=|>|<)\s*(.+)", cond.strip())
-        if not m:
+        match = re.match(r"(.+?)\s*(>=|<=|==|!=|>|<)\s*(.+)", cond.strip())
+        if not match:
             return True
-        field = m.group(1).strip()
-        op = m.group(2)
-        value_str = m.group(3).strip()
+        field = match.group(1).strip()
+        op = match.group(2)
+        value_str = match.group(3).strip()
         actual = self._resolve_ref(field, ctx)
+        if actual is _UNRESOLVED:
+            ctx.log("condition", f"unresolved field reference: {field}", "debug")
         try:
             compare_val = (
                 float(value_str)
@@ -352,16 +503,23 @@ class PlaybookEngine:
 
     @staticmethod
     def _compare(actual: Any, op: str, value: Any) -> bool:
-        if actual is None:
+        if actual is _UNRESOLVED or actual is None:
             return False
-        if op == ">":
-            return float(actual) > float(value)
-        if op == "<":
-            return float(actual) < float(value)
-        if op == ">=":
-            return float(actual) >= float(value)
-        if op == "<=":
-            return float(actual) <= float(value)
+        if op in (">", "<", ">=", "<="):
+            try:
+                left: Any = float(actual)
+                right: Any = float(value)
+            except (TypeError, ValueError):
+                # Non-numeric operands must not abort the whole playbook;
+                # fall back to a lexicographic comparison of their strings.
+                left, right = str(actual), str(value)
+            if op == ">":
+                return left > right
+            if op == "<":
+                return left < right
+            if op == ">=":
+                return left >= right
+            return left <= right
         if op == "==":
             return str(actual) == str(value)
         if op == "!=":
@@ -471,7 +629,12 @@ class PlaybookEngine:
                     queue.append(neighbor)
 
         if len(order) != len(steps):
-            return list(range(len(steps)))
+            cyclic = [
+                steps[i].get("id", f"step_{i}") for i in range(len(steps)) if i not in set(order)
+            ]
+            raise ValueError(
+                "cyclic depends_on detected in playbook steps: " + ", ".join(map(str, cyclic))
+            )
         return order
 
 
