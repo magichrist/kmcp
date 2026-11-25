@@ -76,6 +76,9 @@ class HashcatTool(BaseTool, NormalizedToolMixin):
         mode = arguments.get("mode")
         if mode is not None:
             cmd.extend(["-m", str(mode)])
+        # hashcat's positional order is: hashfile [wordlist]. Putting the
+        # wordlist first makes hashcat treat it as the hash file.
+        cmd.append(arguments["hash_file"])
         wordlist = arguments.get("wordlist")
         if wordlist:
             cmd.append(wordlist)
@@ -84,7 +87,6 @@ class HashcatTool(BaseTool, NormalizedToolMixin):
             cmd.extend(["-r", rule])
         if arguments.get("show"):
             cmd.append("--show")
-        cmd.append(arguments["hash_file"])
         return cmd
 
     def normalize(self, stdout: str, stderr: str, exit_code: int, **kwargs: Any) -> dict[str, Any]:
