@@ -99,22 +99,16 @@ class FileReadTool(BaseTool):
         try:
             file_size = os.path.getsize(path)
 
-            with open(path, "r", errors="replace") as f:  # noqa: ASYNC230
+            # Read in binary mode so max_bytes/offset are byte-accurate even
+            # for multibyte UTF-8; decode only the bytes actually read.
+            with open(path, "rb") as f:  # noqa: ASYNC230
                 if offset > 0:
                     f.seek(offset)
-                content = f.read(max_bytes)
+                raw = f.read(max_bytes)
 
-            truncated = (offset + len(content.encode("utf-8"))) < file_size
-
-            result = {
-                "tool": self.name,
-                "path": path,
-                "file_size": file_size,
-                "offset": offset,
-                "bytes_read": len(content.encode("utf-8")),
-                "truncated": truncated,
-                "content": content,
-            }
+            content = raw.decode("utf-8", errors="replace")
+            bytes_read = len(raw)
+            truncated = (offset + bytes_read) < file_size
 
             result = ExecutionResult(
                 tool=self.name,
@@ -124,7 +118,7 @@ class FileReadTool(BaseTool):
                         "path": path,
                         "file_size": file_size,
                         "offset": offset,
-                        "bytes_read": len(content.encode("utf-8")),
+                        "bytes_read": bytes_read,
                         "truncated": truncated,
                         "content": content,
                     }
