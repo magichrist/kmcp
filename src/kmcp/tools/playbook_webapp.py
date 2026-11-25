@@ -96,7 +96,7 @@ class PlaybookWebappTool(BaseTool):
                 "id": "nuclei",
                 "tool": "nuclei",
                 "depends_on": ["crawl", "params", "ffuf"],
-                "args": {"target": "{{target}}"},
+                "args": {"target": "{{target}}", "timeout": 900},
             },
             {
                 "id": "sqlmap",
@@ -109,7 +109,7 @@ class PlaybookWebappTool(BaseTool):
                 "id": "commix",
                 "tool": "commix",
                 "depends_on": ["params"],
-                "args": {"target": "{{target}}"},
+                "args": {"target": "{{target}}", "timeout": 900},
                 "parallel": True,
             },
             {
