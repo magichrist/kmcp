@@ -96,6 +96,52 @@ def resolve_profile_from_headers(headers: Mapping[str, Any]) -> str | None:
     return profile_id
 
 
+def bound_profile_invalid() -> bool:
+    """True when ``MCP_AGENT_PROFILE_ID`` is configured but cannot be resolved.
+
+    The bound profile is mandatory by config contract. A configured value that
+    is missing from the database (or an unavailable database) must fail closed:
+    callers need to deny the operation rather than fall back to a client header,
+    which would let the client pick its own permissions.
+    """
+    try:
+        from kmcp.config import config
+
+        bound = getattr(config, "agent_profile_id", "")
+    except Exception:  # noqa: BLE001
+        return False
+    bound = str(bound).strip() if bound else ""
+    if not bound:
+        return False
+    db = _db()
+    if db is None:
+        return True
+    try:
+        return db.get_agent_profile(bound) is None
+    except Exception:
+        logger.exception("agent_context: failed to validate bound profile %r", bound)
+        return True
+
+
+def forbidden_profile_payload(profile_id: str) -> str:
+    """Payload text returned when the mandatory bound profile cannot resolve."""
+    import json
+
+    return json.dumps(
+        {
+            "success": False,
+            "error": (
+                f"configured agent profile {profile_id!r} is missing or unavailable; "
+                "all tool calls are denied"
+            ),
+            "forbidden": True,
+            "profile_id": profile_id,
+            "code": 403,
+        },
+        indent=2,
+    )
+
+
 def resolve_from_context(ctx: Any) -> str | None:
     """Resolve the profile from a FastMCP ``Context`` (best-effort).
 
@@ -223,8 +269,10 @@ __all__ = [
     "HEADER_PROFILE",
     "agent_context",
     "assigned_playbooks",
+    "bound_profile_invalid",
     "can_call_tool",
     "forbidden_playbook_payload",
+    "forbidden_profile_payload",
     "forbidden_tool_payload",
     "get_current_profile",
     "is_playbook_assigned",
@@ -241,8 +289,10 @@ class _AgentContextFacade:
     HEADER_PROFILE = HEADER_PROFILE
 
     assigned_playbooks = staticmethod(assigned_playbooks)
+    bound_profile_invalid = staticmethod(bound_profile_invalid)
     can_call_tool = staticmethod(can_call_tool)
     forbidden_playbook_payload = staticmethod(forbidden_playbook_payload)
+    forbidden_profile_payload = staticmethod(forbidden_profile_payload)
     forbidden_tool_payload = staticmethod(forbidden_tool_payload)
     get_current_profile = staticmethod(get_current_profile)
     is_playbook_assigned = staticmethod(is_playbook_assigned)
