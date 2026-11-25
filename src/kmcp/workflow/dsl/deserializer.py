@@ -11,6 +11,7 @@ deserialized and re-parsed to an equivalent definition.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from kmcp.workflow.yaml_loader import PlaybookDefinition
@@ -29,7 +30,10 @@ def _render_type_expr(decl: dict[str, Any]) -> str:
         return f"enum {{{vals}}}"
     if t == "array":
         elem = decl.get("element_type", "string")
-        return f"array [{elem}]"
+        rendered = _render_type_expr(elem) if isinstance(elem, Mapping) else str(elem)
+        return f"array [{rendered}]"
+    if t == "object":
+        return "object"
     return t
 
 
@@ -102,6 +106,8 @@ def deserialize(defn: PlaybookDefinition) -> str:
             lines.append(f"  timeout: {exec_['timeout']}")
         if exec_.get("resume") is not None:
             lines.append(f"  resume: {'true' if exec_['resume'] else 'false'}")
+        if exec_.get("max_iterations") is not None:
+            lines.append(f"  max_iterations: {exec_['max_iterations']}")
         lines.append("}")
 
     # ── steps ────────────────────────────────────────────────────────────

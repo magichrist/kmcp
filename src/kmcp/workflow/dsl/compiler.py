@@ -33,6 +33,7 @@ from kmcp.workflow.dsl.parser import (
     Literal,
     PlaybookAST,
     StepDecl,
+    TypeExpr,
 )
 from kmcp.workflow.yaml_loader import (
     VALID_ON_FAILURE,
@@ -89,6 +90,20 @@ def _field_ref_str(ref: FieldRef) -> str:
 
 def _literal_value(lit: Literal) -> Any:
     return lit.value
+
+
+def _type_decl(expr: TypeExpr) -> dict[str, Any]:
+    """Render a parsed type expression into the canonical input declaration."""
+    decl: dict[str, Any] = {"type": expr.kind}
+    if expr.values is not None:
+        decl["values"] = expr.values
+    if expr.kind == "array" and expr.element is not None:
+        element = expr.element
+        if element.kind in ("array", "enum", "object"):
+            decl["element_type"] = _type_decl(element)
+        else:
+            decl["element_type"] = element.kind
+    return decl
 
 
 def _check_when_condition(cond: str, step_id: str) -> None:
@@ -151,9 +166,7 @@ def compile(
     # ── 4. Input declarations → dict ─────────────────────────────────────
     inputs: dict[str, Any] = {}
     for inp in ast.inputs:
-        decl: dict[str, Any] = {"type": inp.type_expr.kind}
-        if inp.type_expr.values is not None:
-            decl["values"] = inp.type_expr.values
+        decl: dict[str, Any] = _type_decl(inp.type_expr)
         if inp.source is not None:
             decl["source"] = inp.source
         if inp.required:
@@ -170,6 +183,8 @@ def compile(
         execution["timeout"] = ast.execution.timeout
     if ast.execution.resume is not None:
         execution["resume"] = ast.execution.resume
+    if ast.execution.max_iterations is not None:
+        execution["max_iterations"] = ast.execution.max_iterations
 
     # ── 6. Steps ─────────────────────────────────────────────────────────
     step_defs: list[StepDefinition] = []

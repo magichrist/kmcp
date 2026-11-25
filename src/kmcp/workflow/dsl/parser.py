@@ -121,6 +121,7 @@ class Execution:
     max_parallel: int | None = None
     timeout: int | None = None
     resume: bool | None = None
+    max_iterations: int | None = None
 
 
 @dataclass
@@ -399,16 +400,20 @@ class _Parser:
             return TypeExpr(kind="enum", values=values)
 
         if word == "array":
-            self._expect(COLON)
+            # The spec spells ``array: [T]``; older deserializers emitted
+            # ``array [T]``. Accept both so authored DSL round-trips (BUG-037).
+            self._accept(COLON)
             self._expect(LBRACKET)
             element = self._parse_type_expr()
             self._expect(RBRACKET)
             return TypeExpr(kind="array", element=element)
 
         if word == "object":
-            self._expect(COLON)
-            self._expect(LBRACE)
-            self._expect(RBRACE)
+            # Accept both ``object: {}`` and the legacy bare ``object``.
+            self._accept(COLON)
+            if self._at(LBRACE):
+                self._expect(LBRACE)
+                self._expect(RBRACE)
             return TypeExpr(kind="object")
 
         valid_primitives = {
@@ -452,6 +457,9 @@ class _Parser:
             elif key == "resume":
                 vtok = self._expect(BOOL)
                 exec_.resume = bool(vtok.value)
+            elif key == "max_iterations":
+                vtok = self._expect(INTEGER)
+                exec_.max_iterations = int(vtok.value)
             else:
                 raise DSLParseError(
                     f"unknown execution key {key!r}",
