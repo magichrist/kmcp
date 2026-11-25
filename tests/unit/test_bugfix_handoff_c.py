@@ -12,7 +12,6 @@ import re
 from pathlib import Path
 
 import pytest
-import tomllib
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -56,13 +55,23 @@ def _walk_strings(value):
 # ── F-02: packaging ───────────────────────────────────────────────────────
 
 
+def _pyproject_section(header: str) -> str:
+    """Return the body of a TOML section (stdlib-only, Python 3.10 compatible)."""
+    lines: list[str] = []
+    inside = False
+    for line in (REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8").splitlines():
+        if line.lstrip().startswith("["):
+            inside = line.strip() == header
+        elif inside:
+            lines.append(line)
+    return "\n".join(lines)
+
+
 def test_package_data_includes_playbook_yaml():
-    with (REPO_ROOT / "pyproject.toml").open("rb") as f:
-        pyproject = tomllib.load(f)
-    package_data = pyproject["tool"]["setuptools"]["package-data"]
-    patterns = package_data["kmcp"]
-    assert "studio/web/**/*" in patterns
-    assert "playbooks/**/*.yaml" in patterns
+    # Avoid tomllib (Python 3.11+) because CI still runs Python 3.10.
+    package_data = _pyproject_section("[tool.setuptools.package-data]")
+    assert '"studio/web/**/*"' in package_data
+    assert '"playbooks/**/*.yaml"' in package_data
 
 
 def test_manifest_in_includes_playbook_yaml():

@@ -39,6 +39,7 @@ tag_regex = '^(?:v)?(?P<version>[^\+]+)$'
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-q"
 markers = [
     "e2e: end-to-end tests that spawn a real server process (deselect with '-m \"not e2e\"')",
