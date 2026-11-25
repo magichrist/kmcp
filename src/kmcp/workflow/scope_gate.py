@@ -18,6 +18,7 @@ debug line — existing unscoped executions keep working.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from kmcp.scope import Scope, check_scope, is_target_allowed, load_scope
@@ -63,21 +64,36 @@ def extract_targets(args: dict[str, Any]) -> list[str]:
     engine has substituted/allocated their concrete values (e.g. per foreach
     item), or rejected later by the tool-level scope check in ``execution.py``.
     """
-    targets: list[str] = []
-    for key, value in args.items():
-        if str(key).lower() not in TARGET_ARG_KEYS:
-            continue
-        values: list[Any]
-        if isinstance(value, str):
-            values = [value]
+
+    def target_leaves(value: Any) -> Iterator[Any]:
+        """Yield scalar leaves under a target-carrying key, recursively."""
+        if isinstance(value, str) or (
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+        ):
+            yield value
+        elif isinstance(value, Mapping):
+            for nested in value.values():
+                yield from target_leaves(nested)
         elif isinstance(value, (list, tuple)):
-            values = [v for v in value if isinstance(v, (str, int))]
-        else:
-            continue
-        for item in values:
-            text = str(item).strip()
-            if text and not (text.startswith("{{") and text.endswith("}}")):
-                targets.append(text)
+            for item in value:
+                yield from target_leaves(item)
+
+    def walk(value: Any) -> Iterator[Any]:
+        """Walk nested mappings, yielding values of target-carrying keys."""
+        if isinstance(value, Mapping):
+            for key, nested in value.items():
+                if str(key).lower() in TARGET_ARG_KEYS:
+                    yield from target_leaves(nested)
+                yield from walk(nested)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                yield from walk(item)
+
+    targets: list[str] = []
+    for item in walk(args):
+        text = str(item).strip()
+        if text and not (text.startswith("{{") and text.endswith("}}")):
+            targets.append(text)
     seen: set[str] = set()
     unique = []
     for t in targets:
