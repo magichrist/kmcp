@@ -7,6 +7,7 @@ import os
 import shlex
 import socket
 from typing import Any
+from urllib.parse import quote as urlquote
 
 from kmcp.models import ExecutionResult, ToolError, utc_now_iso
 from kmcp.responses import error_response, success_response
@@ -91,7 +92,10 @@ class FileDownloadTool(BaseTool):
 
         host = _get_download_host()
         port = config.port
-        download_url = f"http://{host}:{port}/download?path={shlex.quote(server_path)}"
+        # Percent-encode the path as a URL query value (shlex quoting is for
+        # shells, not URLs), then shell-quote the finished URL exactly once.
+        encoded_path = urlquote(server_path, safe="")
+        download_url = f"http://{host}:{port}/download?path={encoded_path}"
 
         curl_cmd = f"curl -sS -o {shlex.quote(local_path)} {shlex.quote(download_url)}"
 
