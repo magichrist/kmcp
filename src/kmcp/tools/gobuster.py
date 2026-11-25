@@ -68,7 +68,10 @@ class GobusterTool(BaseTool, NormalizedToolMixin):
     def build_command(self, arguments: dict[str, Any]) -> list[str]:
         mode = arguments.get("mode", "dir")
         wordlist = arguments.get("wordlist") or "/usr/share/wordlists/dirb/common.txt"
-        cmd = ["gobuster", mode, "-u", arguments["target"], "-w", wordlist]
+        # Gobuster uses mode-specific target flags: dir -> -u, dns -> -d,
+        # vhost -> -v. Emitting dir's -u for dns/vhost makes those modes unusable.
+        target_flag = {"dir": "-u", "dns": "-d", "vhost": "-v"}.get(mode, "-u")
+        cmd = ["gobuster", mode, target_flag, arguments["target"], "-w", wordlist]
         extensions = arguments.get("extensions")
         if extensions and mode == "dir":
             cmd.extend(["-x", extensions])
