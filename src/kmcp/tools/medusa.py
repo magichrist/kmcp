@@ -10,6 +10,15 @@ from kmcp.tools.persist import parse_medusa, run_tool_with_persistence
 from kmcp.validation import validate_required
 
 
+def _is_host_file(target: str) -> bool:
+    """Only treat ``target`` as a host FILE when it actually looks like a path.
+
+    Medusa's ``-H`` flag expects a file containing a list of hosts; ``-h`` is
+    the flag for a single host address.
+    """
+    return target.startswith(("/", "./", "../", "~")) or "\\" in target
+
+
 def _parse(stdout: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     creds = parse_medusa(stdout)
     findings = [
@@ -70,10 +79,12 @@ class MedusaTool(BaseTool, NormalizedToolMixin):
         validate_required(arguments, "target", "service", "user_list", "pass_list")
 
     def build_command(self, arguments: dict[str, Any]) -> list[str]:
+        target = arguments["target"]
+        host_flag = "-H" if _is_host_file(target) else "-h"
         cmd = [
             "medusa",
-            "-H",
-            arguments["target"],
+            host_flag,
+            target,
             "-U",
             arguments["user_list"],
             "-P",

@@ -65,12 +65,12 @@ class ZizmorTool(BaseTool):
         pass
 
     def build_command(self, arguments: dict[str, Any]) -> list[str]:
-        cmd = ["zizmor"]
+        # --collect is variadic; a separate value would swallow the positional
+        # target. Attach the value with '=' and put the target first.
+        cmd = ["zizmor", arguments["target"]]
 
         collect = arguments.get("collect", "all")
-        cmd.extend(["--collect", collect])
-
-        cmd.append(arguments["target"])
+        cmd.append(f"--collect={collect}")
 
         extra = arguments.get("extra_args")
         if extra:

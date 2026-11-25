@@ -77,7 +77,8 @@ class JohnTool(BaseTool, NormalizedToolMixin):
         cmd = ["john"]
         fmt = arguments.get("format")
         if fmt:
-            cmd.extend(["--format", fmt])
+            # John's option parser requires the value attached with '='.
+            cmd.append(f"--format={fmt}")
         wordlist = arguments.get("wordlist")
         if wordlist:
             cmd.extend(["--wordlist", wordlist])

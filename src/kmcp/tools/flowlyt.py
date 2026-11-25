@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shlex
 from typing import Any
 
@@ -12,6 +13,16 @@ from kmcp.responses import error_response, success_response
 from kmcp.tools.base import BaseTool
 
 logger = logging.getLogger("kmcp.tools")
+
+# "owner/repo" is a remote GitHub-style slug, not a local filesystem path.
+_SLUG_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+
+def _repo_flag(repo: str) -> str:
+    """flowlyt needs an explicit --repo (path) or --url (remote reference)."""
+    if repo.startswith(("http://", "https://", "git@")) or _SLUG_RE.match(repo):
+        return "--url"
+    return "--repo"
 
 
 class FlowlytTool(BaseTool):
@@ -61,10 +72,11 @@ class FlowlytTool(BaseTool):
     def build_command(self, arguments: dict[str, Any]) -> list[str]:
         cmd = ["flowlyt", "scan"]
 
+        repo = arguments["repo"]
+        cmd.extend([_repo_flag(repo), repo])
+
         if arguments.get("workflow_file"):
             cmd.extend(["--file", arguments["workflow_file"]])
-
-        cmd.append(arguments["repo"])
 
         extra = arguments.get("extra_args")
         if extra:

@@ -2,12 +2,46 @@
 
 from __future__ import annotations
 
+import shlex
 from typing import Any
 
 from kmcp.tools.base import BaseTool
 from kmcp.tools.normalization import NormalizedToolMixin
 from kmcp.tools.persist import parse_wfuzz, run_tool_with_persistence
 from kmcp.validation import validate_required
+
+
+def _filter_tokens(filters: str | list[str] | tuple[str, ...]) -> list[str]:
+    """Normalize a filter into exactly one ``--filter <expression>`` pair.
+
+    Accepts a bare expression (``200``), a pre-prefixed string
+    (``--filter 200`` / ``--filter=200``), or a list of tokens.
+    """
+    if isinstance(filters, str):
+        raw = filters.strip()
+        if not raw:
+            return []
+        if raw.startswith("--filter="):
+            expression = raw.split("=", 1)[1].strip()
+        elif raw.startswith("--filter"):
+            tokens = shlex.split(raw)
+            if tokens and tokens[0] == "--filter":
+                expression = " ".join(tokens[1:]).strip()
+            else:
+                expression = raw
+        else:
+            expression = raw
+    else:
+        tokens = [str(token).strip() for token in filters if str(token).strip()]
+        if not tokens:
+            return []
+        if tokens[0].startswith("--filter="):
+            expression = tokens[0].split("=", 1)[1].strip()
+        elif tokens[0] == "--filter":
+            expression = " ".join(tokens[1:]).strip()
+        else:
+            expression = " ".join(tokens)
+    return ["--filter", expression] if expression else []
 
 
 def _parse(stdout: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -76,7 +110,7 @@ class WfuzzTool(BaseTool, NormalizedToolMixin):
             cmd.extend(["-X", methods])
         filters = arguments.get("filters")
         if filters:
-            cmd.extend(["--filter", filters])
+            cmd.extend(_filter_tokens(filters))
         return cmd
 
     def normalize(self, stdout: str, stderr: str, exit_code: int, **kwargs: Any) -> dict[str, Any]:
