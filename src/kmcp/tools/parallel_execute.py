@@ -21,7 +21,7 @@ def _result_payload(res: dict[str, Any]) -> dict[str, Any] | None:
         return None
 
 
-def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_results(results: list[dict[str, Any]], target: str = "") -> dict[str, Any]:
     """Aggregate and deduplicate findings across sub-tool results.
 
     Dedup keys (per plan):
@@ -48,7 +48,9 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         except Exception:  # noqa: BLE001, S110
             pass
 
-        target = data.get("tool")  # per-tool section marker
+        # Dedup on the assessed target, not the producing tool name — the
+        # same port/finding reported by two sub-tools is one observation.
+        dedup_target = target or data.get("target") or ""
         for line in stdout.splitlines():
             line = line.strip()
             # Port lines: "80/tcp open" or "Discovered open port 80/tcp on x"
@@ -57,11 +59,11 @@ def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any]:
                 for i, p in enumerate(parts):
                     if "/" in p and p.split("/")[0].isdigit():
                         port, proto = p.split("/", 1)
-                        key = (data.get("command", ""), port, proto)
+                        key = (dedup_target, port, proto)
                         ports.setdefault(key, {"source": data.get("tool"), "detail": line[:200]})
             # Vulnerability markers
             if any(tag in line.lower() for tag in ("vulnerab", "cve-", "[+]")) and len(line) < 300:
-                key = (target, line[:80])
+                key = (dedup_target, line[:80])
                 vulns.setdefault(key, {"source": data.get("tool"), "detail": line})
 
     return {
@@ -138,6 +140,7 @@ class ParallelExecuteTool(BaseTool):
         self.validate(arguments)
         tool_specs: list[dict[str, Any]] = arguments["tools"]
         max_concurrent = arguments.get("max_concurrent", 4)
+        target = arguments["target"]
 
         import asyncio
 
@@ -161,13 +164,17 @@ class ParallelExecuteTool(BaseTool):
             tool = registry.get(tool_name)
             if tool is None:
                 return {"tool": tool_name, "error": "unknown tool"}
+            args = dict(spec.get("args") or {})
+            # The shared target is declared/required by this tool; sub-tools
+            # must receive it even when the spec omits it.
+            args.setdefault("target", target)
             async with sem:
-                res = await tool.safe_execute(spec.get("args", {}))
+                res = await tool.safe_execute(args)
                 job["done"] += 1
                 return res
 
         results = await asyncio.gather(*(run_one(ts) for ts in tool_specs))
-        aggregate = aggregate_results(list(results))
+        aggregate = aggregate_results(list(results), target=target)
 
         job["status"] = "completed"
         job["finished_at"] = utc_now_iso()
