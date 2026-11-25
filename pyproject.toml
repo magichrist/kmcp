@@ -30,7 +30,7 @@ kmcp = "kmcp.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-kmcp = ["studio/web/**/*"]
+kmcp = ["studio/web/**/*", "playbooks/**/*.yaml"]
 
 [tool.setuptools_scm]
 write_to = "src/kmcp/_version.py"

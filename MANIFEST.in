@@ -1,2 +1,4 @@
 graft src/kmcp/studio/web
+graft src/kmcp/playbooks
 include .env.example
+include *.yaml
