@@ -19,7 +19,7 @@ import time
 import uuid
 
 from kmcp.config import config
-from kmcp.isolation import StepLimits, spawn_isolated
+from kmcp.isolation import StepLimits
 from kmcp.logging_utils import log_execution
 from kmcp.models import ExecutionResult, utc_now_iso
 from kmcp.scope import check_scope, load_scope
@@ -54,6 +54,74 @@ async def _call_progress(progress_cb, completed: int, total: int) -> None:
         await result
 
 
+async def _spawn_isolated_tracked(
+    cmd: list[str],
+    limits: StepLimits,
+    timeout: float,
+    on_proc=None,
+) -> tuple[int, str, str, float]:
+    """Run a non-shell command with the isolation guard, exposing the process.
+
+    Mirrors ``kmcp.isolation.spawn_isolated`` (best-effort rlimits, wall-clock
+    timeout, process-tree kill on expiry) but hands the live subprocess to
+    ``on_proc`` so the engine can terminate it on cancellation or through
+    kill_job / watchdog / force_cleanup. On cancellation the tree is killed
+    and the cancellation is re-raised.
+    """
+    import shutil
+
+    from kmcp.isolation import _SYSTEM, _posix_rlimit_preexec
+
+    start = time.monotonic()
+    binary = cmd[0] if cmd else "unknown"
+    if not shutil.which(binary):
+        return -1, "", f"Binary not found: {binary}", round(time.monotonic() - start, 3)
+
+    preexec_fn = _posix_rlimit_preexec(limits) if _SYSTEM == "Linux" else None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=limits.cwd,
+            env=limits.env,
+            start_new_session=True,
+            preexec_fn=preexec_fn,
+        )
+    except FileNotFoundError:
+        return -1, "", f"Binary not found: {binary}", round(time.monotonic() - start, 3)
+    except Exception as exc:
+        logger.exception("execution: failed to spawn %s", binary)
+        return -1, "", f"Internal error: {type(exc).__name__}", round(time.monotonic() - start, 3)
+
+    if on_proc is not None:
+        on_proc(proc)
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        exit_code = proc.returncode or 0
+    except (TimeoutError, asyncio.TimeoutError):
+        await kill_process_tree(proc)
+        try:
+            stdout_bytes, stderr_bytes = await proc.communicate()
+        except Exception:  # noqa: BLE001
+            stdout_bytes, stderr_bytes = b"", b""
+        stderr_text = stderr_bytes.decode("utf-8", "replace") if stderr_bytes else ""
+        stderr_text = (
+            f"Timed out after {timeout}s\n{stderr_text}".strip()
+            if stderr_text
+            else f"Timed out after {timeout}s"
+        )
+        return -1, "", stderr_text, round(time.monotonic() - start, 3)
+    except asyncio.CancelledError:
+        await kill_process_tree(proc)
+        raise
+
+    stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
+    stderr = stderr_bytes.decode("utf-8", errors="replace") if stderr_bytes else ""
+    return exit_code, stdout, stderr, round(time.monotonic() - start, 3)
+
+
 def _enforce_scope(tool_name: str | None, target: str | None) -> None:
     """Scope enforcement hook.
 
@@ -82,6 +150,7 @@ class ExecutionEngine:
         self._active: dict[str, str] = {}  # request_id → tool
         self._request_times: dict[str, float] = {}  # request_id → start monotonic
         self._procs: dict[str, asyncio.subprocess.Process] = {}  # request_id → process
+        self._loop: asyncio.AbstractEventLoop | None = None  # loop owning spawned procs
         self._watchdog_running = False
         self._request_count = 0
         self._error_count = 0
@@ -109,13 +178,33 @@ class ExecutionEngine:
                         tool,
                         now - t,
                     )
-                    self._active.pop(rid, None)
-                    self._request_times.pop(rid, None)
+                    self._pop_and_kill(rid)
 
         t = threading.Thread(target=_watchdog, daemon=True, name="exec-watchdog")
         t.start()
 
+    def _schedule_kill(self, proc: asyncio.subprocess.Process) -> None:
+        """Kill a registered process from a sync context (watchdog / cleanup)."""
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(kill_process_tree(proc), loop)
+        except RuntimeError:  # loop stopped between the check and scheduling
+            pass
+
+    def _pop_and_kill(self, req_id: str) -> asyncio.subprocess.Process | None:
+        """Stop tracking a request and schedule termination of its process."""
+        self._active.pop(req_id, None)
+        self._request_times.pop(req_id, None)
+        proc = self._procs.pop(req_id, None)
+        if proc is not None:
+            self._schedule_kill(proc)
+        return proc
+
     def _cleanup_request(self, req_id: str) -> None:
+        # The process has already been killed by the relevant timeout /
+        # cancellation / kill path — only the tracking entries are dropped.
         self._active.pop(req_id, None)
         self._request_times.pop(req_id, None)
         self._procs.pop(req_id, None)
@@ -143,6 +232,10 @@ class ExecutionEngine:
         ``job_id`` are opaque handles stored on result records for traceability.
         """
         self._start_watchdog()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:  # defensive — execute() is always awaited
+            self._loop = None
         req_id = request_id or uuid.uuid4().hex[:12]
         try:
             effective_timeout = min(int(timeout or config.default_timeout), config.max_timeout)
@@ -290,6 +383,15 @@ class ExecutionEngine:
                             )
                             log_execution(result)
                             return result
+                        except asyncio.CancelledError:
+                            # Cancellation is a BaseException: it bypasses the
+                            # timeout branch above. Kill the detached process
+                            # group before letting cancellation propagate.
+                            try:
+                                await kill_process_tree(proc)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            raise
                         finally:
                             if heartbeat_task is not None:
                                 heartbeat_task.cancel()
@@ -298,8 +400,8 @@ class ExecutionEngine:
                         result = ExecutionResult(
                             tool=tool,
                             command=command_str,
-                            stdout=stdout_bytes.decode("utf-8", errors="replace"),
-                            stderr=stderr_bytes.decode("utf-8", errors="replace"),
+                            stdout=stdout_bytes.decode("utf-8", errors="replace")[:MAX_OUTPUT],
+                            stderr=stderr_bytes.decode("utf-8", errors="replace")[:MAX_OUTPUT],
                             exit_code=proc.returncode if proc.returncode is not None else 0,
                             success=(proc.returncode == 0),
                             timed_out=False,
@@ -319,8 +421,16 @@ class ExecutionEngine:
                             env=exec_env,
                         )
                         try:
-                            exit_code, stdout_str, stderr_str, _duration = await spawn_isolated(
-                                command, limits
+                            (
+                                exit_code,
+                                stdout_str,
+                                stderr_str,
+                                _duration,
+                            ) = await _spawn_isolated_tracked(
+                                command,
+                                limits,
+                                effective_timeout,
+                                on_proc=lambda proc: self._procs.__setitem__(req_id, proc),
                             )
                         except FileNotFoundError:
                             elapsed = time.monotonic() - start_monotonic
@@ -376,21 +486,11 @@ class ExecutionEngine:
 
         except asyncio.CancelledError:
             logger.warning("request=%s execution cancelled", req_id)
-            elapsed = time.monotonic() - start_monotonic
             with self._lock:
                 self._error_count += 1
-            return ExecutionResult(
-                tool=tool,
-                command=command_str,
-                stdout="",
-                stderr="Execution cancelled",
-                exit_code=-1,
-                success=False,
-                timed_out=False,
-                duration=round(elapsed, 3),
-                start_time=start_time,
-                end_time=utc_now_iso(),
-            )
+            # Cancellation must reach the caller; the process tree has already
+            # been killed by the mode-specific handler above.
+            raise
         except Exception as e:
             elapsed = time.monotonic() - start_monotonic
             logger.exception("request=%s unexpected execution error", req_id)
@@ -458,7 +558,7 @@ class ExecutionEngine:
         """
         proc = None
         with self._lock:
-            if request_id not in self._active:
+            if request_id not in self._active and request_id not in self._procs:
                 return False
             proc = self._procs.pop(request_id, None)
             self._active.pop(request_id, None)
@@ -473,9 +573,14 @@ class ExecutionEngine:
 
     def force_cleanup(self) -> int:
         """Force cleanup of all tracked requests. Returns count cleaned."""
-        count = len(self._active)
-        self._active.clear()
-        self._request_times.clear()
+        with self._lock:
+            count = len(self._active)
+            procs = list(self._procs.values())
+            self._active.clear()
+            self._request_times.clear()
+            self._procs.clear()
+        for proc in procs:
+            self._schedule_kill(proc)
         gc.collect()
         return count
 
