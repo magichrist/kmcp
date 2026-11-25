@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import uuid
 from datetime import datetime, timezone
@@ -50,6 +51,8 @@ from kmcp.responses import error_response, success_response
 from kmcp.tools.base import BaseTool
 from kmcp.utils.vault import can_access, vault_query, vault_read, vault_write
 from kmcp.workflow import PlaybookDefinition, run_playbook_async
+
+logger = logging.getLogger("kmcp.tools")
 
 # Tool layer classification (used by tool_catalog and Agent vs Expert mode)
 TOOL_LAYERS: dict[str, str] = {
@@ -212,6 +215,48 @@ def _make_assessment_result(
     return success_response(result)
 
 
+def _assessment_error_payload(
+    assessment_id: str,
+    job_id: str | None,
+    exc: Exception,
+    detail: str = "summary",
+    include_raw: bool = False,
+) -> dict[str, Any]:
+    """Structured, inspectable failure payload for an assessment run."""
+    return {
+        "assessment_id": assessment_id,
+        "job_id": job_id,
+        "status": "failed",
+        "summary": {
+            "assets_discovered": 0,
+            "services_discovered": 0,
+            "findings": {"critical": 0, "high": 0, "medium": 0, "low": 0},
+        },
+        "findings": [],
+        "next_actions": ["Review the error and retry the assessment."],
+        "output_level": detail,
+        "raw_included": include_raw,
+        "error": {"type": type(exc).__name__, "message": str(exc)},
+    }
+
+
+def _assessment_payload_result(payload: dict[str, Any]) -> dict[str, Any]:
+    """Wrap a structured assessment payload in an MCP tool response."""
+    result = ExecutionResult(
+        tool="assessment_run",
+        command="assessment_run",
+        stdout=json.dumps(payload, indent=2),
+        stderr="",
+        exit_code=0,
+        success=False,
+        timed_out=False,
+        duration=0.0,
+        start_time=utc_now_iso(),
+        end_time=utc_now_iso(),
+    )
+    return success_response(result)
+
+
 def _extract_assets_from_findings(findings: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Best-effort extraction of asset references from finding records."""
     assets: list[dict[str, Any]] = []
@@ -229,6 +274,45 @@ def _extract_assets_from_findings(findings: list[dict[str, Any]]) -> list[dict[s
                 }
             )
     return assets
+
+
+# ── job registries (job_control resolves these before the vault) ────────
+
+# Filled by BatchRunTool; parallel_execute keeps its own JOBS registry.
+BATCH_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def _lookup_external_job(job_id: str) -> tuple[str, dict[str, Any]] | None:
+    """Resolve a parallel_execute (par_*) or batch_run (batch_*) job id."""
+    if job_id.startswith("par_"):
+        try:
+            from kmcp.tools.parallel_execute import JOBS as PARALLEL_JOBS
+        except Exception:
+            return None
+        entry = PARALLEL_JOBS.get(job_id)
+        return ("parallel_execute", dict(entry)) if entry is not None else None
+    if job_id.startswith("batch_"):
+        entry = BATCH_JOBS.get(job_id)
+        return ("batch_run", dict(entry)) if entry is not None else None
+    return None
+
+
+def _job_control_response(
+    payload: dict[str, Any], *, success: bool = True, timed_out: bool = False
+) -> dict[str, Any]:
+    result = ExecutionResult(
+        tool="job_control",
+        command="job_control",
+        stdout=json.dumps(payload, indent=2),
+        stderr="",
+        exit_code=0,
+        success=success,
+        timed_out=timed_out,
+        duration=0.0,
+        start_time=utc_now_iso(),
+        end_time=utc_now_iso(),
+    )
+    return success_response(result)
 
 
 # ── 1. assessment_run ────────────────────────────────────────────────────
@@ -457,8 +541,9 @@ class AssessmentRunTool(BaseTool):
                 raw_included=include_raw,
             )
 
-        # Short assessment: execute inline
-        findings, assets, next_actions = await self._run_assessment_inline(
+        # Short assessment: execute inline. The helper returns a structured
+        # error payload (dict) instead of raising when execution fails.
+        inline_result = await self._run_assessment_inline(
             workflow,
             targets,
             scope_id,
@@ -470,6 +555,20 @@ class AssessmentRunTool(BaseTool):
             include_raw,
             assessment_id,
         )
+        if isinstance(inline_result, dict):
+            self._write_assessment_vault_summary(
+                assessment_id=assessment_id,
+                job_id=job_id,
+                status="failed",
+                summary=inline_result["summary"],
+                findings=[],
+                next_actions=inline_result["next_actions"],
+                targets=targets,
+                error=inline_result["error"],
+            )
+            return _assessment_payload_result(inline_result)
+
+        findings, assets, next_actions = inline_result
 
         summary = {
             "assets_discovered": len(assets),
@@ -520,48 +619,77 @@ class AssessmentRunTool(BaseTool):
         detail: str,
         include_raw: bool,
         assessment_id: str,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]] | dict[str, Any]:
         """Run the assessment inline through the DAG engine / YAML playbook.
 
         Every workflow is backed by a YAML playbook definition under
         ``src/kmcp/playbooks/definitions/`` and executed by the DAG engine,
         replacing the previous hardcoded if/elif chain.
         """
-        findings: list[dict[str, Any]] = []
-        assets: list[dict[str, Any]] = []
-        next_actions: list[str] = []
+        try:
+            findings: list[dict[str, Any]] = []
+            assets: list[dict[str, Any]] = []
+            next_actions: list[str] = []
 
-        for target in targets:
-            pb = self._load_workflow_playbook(workflow)
-            # Wire the target into the playbook so {{target}} substitution works
-            # in step args and module defaults.
-            pb.inputs["target"] = target
-            pb.inputs["targets"] = target
-            pb.execution["max_parallel"] = max_parallel
-            pb.execution["timeout"] = max_duration
+            for target in targets:
+                pb = self._load_workflow_playbook(workflow)
+                # Wire the target into the playbook so {{target}} substitution works
+                # in step args and module defaults.
+                pb.inputs["target"] = target
+                pb.inputs["targets"] = target
+                pb.execution["max_parallel"] = max_parallel
+                pb.execution["timeout"] = max_duration
 
-            res = await run_playbook_async(pb, resume=resume)
-            step_findings, step_assets = self._extract_findings_assets(res)
-            findings.extend(step_findings)
-            assets.extend(step_assets)
+                res = await run_playbook_async(pb, resume=resume)
+                step_findings, step_assets = self._extract_findings_assets(res)
+                findings.extend(step_findings)
+                assets.extend(step_assets)
 
-        next_actions = self._default_next_actions(workflow)
-        return findings, assets, next_actions
+            next_actions = self._default_next_actions(workflow)
+            return findings, assets, next_actions
+        except ValueError:
+            # Unknown workflow / malformed playbook is a caller error and
+            # keeps its existing ValueError contract.
+            logger.exception(
+                "assessment_run invalid workflow (assessment=%s, workflow=%s)",
+                assessment_id,
+                workflow,
+            )
+            raise
+        except Exception as exc:
+            logger.exception(
+                "assessment_run inline execution failed (assessment=%s, workflow=%s)",
+                assessment_id,
+                workflow,
+            )
+            return _assessment_error_payload(assessment_id, None, exc, detail, include_raw)
 
     def _load_workflow_playbook(self, workflow: str) -> PlaybookDefinition:
         """Load the YAML playbook definition backing a workflow name.
 
-        All playbook definitions live under ``resources/playbooks/`` so that
-        built-in and user-authored playbooks share one location.
+        Wheel installs ship the built-in definitions inside the package at
+        ``src/kmcp/playbooks/definitions/``; the repository copy under
+        ``resources/playbooks/`` is kept as a fallback for source checkouts.
         """
         from kmcp.workflow import load_playbook
 
-        project_root = Path(__file__).resolve().parent.parent.parent.parent
-        playbooks_dir = project_root / "resources" / "playbooks"
         filename = self._WORKFLOW_PLAYBOOKS.get(workflow)
         if not filename:
             raise ValueError(f"Unknown workflow: {workflow}")
-        return load_playbook(str(playbooks_dir / filename))
+
+        here = Path(__file__).resolve()
+        candidates = [
+            here.parents[1] / "playbooks" / "definitions" / filename,
+            here.parents[2] / "playbooks" / "definitions" / filename,
+            here.parents[3] / "resources" / "playbooks" / filename,
+        ]
+        for path in candidates:
+            if path.is_file():
+                return load_playbook(str(path))
+        raise FileNotFoundError(
+            f"Playbook definition '{filename}' for workflow '{workflow}' not found; "
+            "tried: " + ", ".join(str(p) for p in candidates)
+        )
 
     def _extract_findings_assets(
         self, res: ExecutionResult
@@ -684,6 +812,7 @@ class AssessmentRunTool(BaseTool):
         findings: list[dict[str, Any]],
         next_actions: list[str],
         targets: list[str],
+        error: dict[str, str] | None = None,
     ) -> None:
         """Deposit a completed assessment summary into the vault assessments
         category so report_generate / job_control can consume it by id."""
@@ -696,6 +825,8 @@ class AssessmentRunTool(BaseTool):
                 "findings": findings,
                 "next_actions": next_actions,
             }
+            if error is not None:
+                payload["error"] = error
             vault_write(
                 category="assessments",
                 name=assessment_id,
@@ -727,7 +858,7 @@ class AssessmentRunTool(BaseTool):
     ) -> None:
         """Background task for long-running assessments."""
         try:
-            findings, assets, next_actions = await self._run_assessment_inline(
+            inline_result = await self._run_assessment_inline(
                 workflow,
                 targets,
                 scope_id,
@@ -739,6 +870,20 @@ class AssessmentRunTool(BaseTool):
                 include_raw,
                 assessment_id,
             )
+            if isinstance(inline_result, dict):
+                # Inline helper already logged and structured the failure.
+                self._write_assessment_vault_summary(
+                    assessment_id=assessment_id,
+                    job_id=job_id,
+                    status="failed",
+                    summary=inline_result["summary"],
+                    findings=[],
+                    next_actions=inline_result["next_actions"],
+                    targets=targets,
+                    error=inline_result["error"],
+                )
+                return
+            findings, assets, next_actions = inline_result
             summary = {
                 "assets_discovered": len(assets),
                 "services_discovered": sum(len(a.get("services", [])) for a in assets),
@@ -749,7 +894,7 @@ class AssessmentRunTool(BaseTool):
                     "low": sum(1 for f in findings if f.get("severity") == "low"),
                 },
             }
-            # Store completed result in vault for retrieval
+            # Store completed result in vault for retrieval (report_generate).
             self._write_assessment_vault_summary(
                 assessment_id=assessment_id,
                 job_id=job_id,
@@ -759,15 +904,22 @@ class AssessmentRunTool(BaseTool):
                 next_actions=next_actions,
                 targets=targets,
             )
-        except Exception:  # noqa: BLE001
-            payload = {"assessment_id": assessment_id, "job_id": job_id, "status": "failed"}
-            vault_write(
-                category="assessments",
-                name=assessment_id,
-                content=payload,
-                target=",".join(targets),
-                tool=self.name,
-                tags=f"assessment:{assessment_id},job:{job_id}",
+        except Exception as exc:
+            logger.exception(
+                "assessment_run background execution failed (assessment=%s, job=%s)",
+                assessment_id,
+                job_id,
+            )
+            payload = _assessment_error_payload(assessment_id, job_id, exc, detail, include_raw)
+            self._write_assessment_vault_summary(
+                assessment_id=assessment_id,
+                job_id=job_id,
+                status="failed",
+                summary=payload["summary"],
+                findings=[],
+                next_actions=payload["next_actions"],
+                targets=targets,
+                error=payload["error"],
             )
 
 
@@ -935,6 +1087,21 @@ class BatchRunTool(BaseTool):
             start_time=utc_now_iso(),
             end_time=utc_now_iso(),
         )
+        # Mirror the batch result into a registry so job_control can resolve
+        # batch_* ids without a vault entry (batch_run is fully synchronous).
+        now = _now_utc()
+        BATCH_JOBS[batch_id] = {
+            "job_id": batch_id,
+            "assessment_id": assessment_id,
+            "tool": self.name,
+            "status": "completed" if failed == 0 else "failed",
+            "total_operations": len(ops),
+            "successful": successful,
+            "failed": failed,
+            "result": payload,
+            "started_at": now,
+            "finished_at": now,
+        }
         return success_response(result)
 
 
@@ -1011,6 +1178,12 @@ class JobControlTool(BaseTool):
         job_id = arguments["job_id"]
         action = arguments.get("action", "status")
         timeout = arguments.get("timeout", 60)
+
+        # parallel_execute / batch_run jobs live in in-memory registries, not
+        # in the assessments vault — delegate before the vault lookup.
+        external = _lookup_external_job(job_id)
+        if external is not None:
+            return await self._external_job_response(job_id, *external, action, timeout)
 
         # Look up job result in vault
         try:
@@ -1182,6 +1355,61 @@ class JobControlTool(BaseTool):
             return success_response(result)
 
         return error_response(ToolError(error="unknown action", details=action))
+
+    async def _external_job_response(
+        self,
+        job_id: str,
+        tool_name: str,
+        entry: dict[str, Any],
+        action: str,
+        timeout: int,
+    ) -> dict[str, Any]:
+        """Serve status/wait/cancel for parallel_execute and batch_run jobs."""
+        if action == "cancel":
+            if tool_name == "batch_run" and job_id in BATCH_JOBS:
+                BATCH_JOBS[job_id]["status"] = "cancelled"
+            elif tool_name == "parallel_execute":
+                try:
+                    from kmcp.tools.parallel_execute import JOBS as PARALLEL_JOBS
+
+                    if job_id in PARALLEL_JOBS:
+                        PARALLEL_JOBS[job_id]["status"] = "cancelled"
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            return _job_control_response(
+                {"job_id": job_id, "tool": tool_name, "status": "cancelled"}
+            )
+
+        terminal = ("completed", "failed", "cancelled")
+        if action == "wait" and entry.get("status") not in terminal:
+            deadline = asyncio.get_event_loop().time() + timeout
+            while asyncio.get_event_loop().time() < deadline:
+                await asyncio.sleep(0.1)
+                refreshed = _lookup_external_job(job_id)
+                if refreshed is not None and refreshed[1].get("status") in terminal:
+                    entry = refreshed[1]
+                    break
+            else:
+                return _job_control_response(
+                    {
+                        "job_id": job_id,
+                        "tool": tool_name,
+                        "status": "timeout",
+                        "message": f"Job did not complete within {timeout}s",
+                    },
+                    success=False,
+                    timed_out=True,
+                )
+
+        result = entry.get("result") if isinstance(entry.get("result"), dict) else entry
+        return _job_control_response(
+            {
+                "job_id": job_id,
+                "tool": tool_name,
+                "status": entry.get("status", "unknown"),
+                "result": result,
+            }
+        )
 
 
 # ── 4. findings_query ────────────────────────────────────────────────────
@@ -1638,7 +1866,12 @@ class ToolCatalogTool(BaseTool):
         mode = arguments.get("mode", "agent")
         search = arguments.get("search", "").lower()
 
-        allowed = set(AGENT_MODE_TOOLS if mode == "agent" else EXPERT_MODE_TOOLS)
+        # Expert mode must expose the full registry surface (the kmcp_help
+        # catalog), not the static TOOL_LAYERS subset. Agent mode stays compact.
+        from kmcp.registry import VISIBILITY_MODES, registry
+
+        registered = list(registry.list_all())
+        allowed = set(AGENT_MODE_TOOLS) if mode == "agent" else {t.name for t in registered}
 
         # Profile-aware filtering (Phase 6): when a request resolves to an
         # agent profile, the catalog only lists tools the profile may call —
@@ -1662,10 +1895,8 @@ class ToolCatalogTool(BaseTool):
         # Only tools explicitly demoted from agent_callable are hidden from
         # the catalog. Tools without a registry definition stay visible
         # (backwards compatible with runtime-only tools and test doubles).
-        from kmcp.registry import VISIBILITY_MODES, registry
-
         tools = []
-        for candidate in registry.list_all():
+        for candidate in registered:
             defn = registry.get_definition(candidate.name)
             visibility = getattr(defn, "visibility", None) if defn is not None else None
             if visibility in VISIBILITY_MODES and visibility != "agent_callable":
@@ -2319,7 +2550,10 @@ class FindingTransitionTool(BaseTool):
         return {
             "type": "object",
             "properties": {
-                "finding_id": {"type": "string", "description": "Finding identifier (required)"},
+                "finding_id": {
+                    "type": ["string", "integer"],
+                    "description": "Finding identifier (required)",
+                },
                 "new_state": {
                     "type": "string",
                     "description": "observed | suspected | validated | remediated | false_positive | accepted_risk",
@@ -2354,14 +2588,18 @@ class FindingTransitionTool(BaseTool):
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
         self.validate(arguments)
 
-        finding_id = arguments["finding_id"]
+        # Agents may send a numeric finding id; VerificationStates keys are
+        # strings and SQLite coerces the text back for an INTEGER id column.
+        finding_id = str(arguments["finding_id"])
         new_state = arguments["new_state"]
         source = arguments.get("source", "agent_interface")
         reason = arguments.get("reason", "")
 
-        # Get current state from DB if available, then transition in-memory
+        # Read the current state from DB if available. The write is deferred
+        # until after lifecycle validation so rejected transitions are inert.
         db = dbm.get_db()
         previous_state = "observed"
+        db_has_finding = False
         if db is not None:
             try:
                 rows = db.conn.execute(
@@ -2369,14 +2607,9 @@ class FindingTransitionTool(BaseTool):
                     (finding_id,),
                 ).fetchall()
                 if rows:
-                    previous_state = rows[0][0]
-                    # Persist the new state back to the findings table
-                    db.conn.execute(
-                        "UPDATE findings SET validation_status = ?, updated_at = ? WHERE id = ?",
-                        (new_state, utc_now_iso(), finding_id),
-                    )
-                    db.conn.commit()
-            except Exception:  # noqa: BLE001
+                    previous_state = rows[0][0] or "observed"
+                    db_has_finding = True
+            except Exception:  # noqa: BLE001, S110
                 pass
 
         # Use VerificationStates for lifecycle validation
@@ -2408,6 +2641,17 @@ class FindingTransitionTool(BaseTool):
 
         ok = states.transition(finding_id, new_state, source, reason)
         history = states.get_transition_history(finding_id)
+
+        # Persist only a valid transition, and only for a finding that exists.
+        if ok and db is not None and db_has_finding:
+            try:
+                db.conn.execute(
+                    "UPDATE findings SET validation_status = ?, updated_at = ? WHERE id = ?",
+                    (new_state, utc_now_iso(), finding_id),
+                )
+                db.conn.commit()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
         payload = {
             "success": ok,
