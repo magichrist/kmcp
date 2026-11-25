@@ -846,9 +846,28 @@ class PlaybookEngine:
             # ``replace`` preserves *every* field — shell steps need their
             # command/inputs/filter, and clearing ``foreach`` prevents the
             # clone from recursing into another iteration pass.
-            iter_args = copy.deepcopy(step.args) if isinstance(step.args, dict) else {}
+            #
+            # R-05: bind the item into the clone so tool steps see concrete
+            # values (not a literal "{{item}}") and shell steps resolve
+            # ``{{item}}``/``{{_foreach_item}}``/``{item}`` in command and
+            # inputs. Substitute into every string leaf of args/inputs/command.
+            iter_args = self._substitute_item(
+                copy.deepcopy(step.args) if isinstance(step.args, dict) else {}, item
+            )
             iter_args["_foreach_item"] = item
-            iter_step = replace(step, id=f"{step.id}_foreach", foreach=None, args=iter_args)
+            iter_inputs = self._substitute_item(
+                copy.deepcopy(step.inputs) if isinstance(step.inputs, dict) else {},
+                item,
+            )
+            iter_command = self._substitute_item(step.command, item)
+            iter_step = replace(
+                step,
+                id=f"{step.id}_foreach",
+                foreach=None,
+                args=iter_args,
+                inputs=iter_inputs,
+                command=iter_command,
+            )
             try:
                 res = await self._execute_single_step(iter_step, state)
             except ScopeViolationError as e:
@@ -862,6 +881,29 @@ class PlaybookEngine:
             results.append(res)
 
         return {"step": step.id, "foreach_results": results, "count": len(results)}
+
+    def _substitute_item(self, value: Any, item: Any) -> Any:
+        """Recursively substitute the foreach item into placeholder forms.
+
+        Replaces ``{{item}}``, ``{{_foreach_item}}`` and ``{item}`` text
+        fragments, and treats a value that is exactly the string
+        ``"_foreach_item"`` as a plain value reference to the current item.
+        Non-string scalars pass through unchanged; containers are recursed
+        into so nested tool args and shell inputs see the concrete value.
+        """
+        if isinstance(value, str):
+            if value == "_foreach_item":
+                return item
+            text = value.replace("{{_foreach_item}}", str(item))
+            text = text.replace("{{item}}", str(item))
+            return text.replace("{item}", str(item))
+        if isinstance(value, dict):
+            return {k: self._substitute_item(v, item) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._substitute_item(v, item) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._substitute_item(v, item) for v in value)
+        return value
 
     # ── helpers ─────────────────────────────────────────────────────────
 

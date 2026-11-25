@@ -104,13 +104,18 @@ class WfuzzTool(BaseTool, NormalizedToolMixin):
 
     def build_command(self, arguments: dict[str, Any]) -> list[str]:
         wordlist = arguments.get("wordlist") or "/usr/share/wordlists/dirb/common.txt"
-        cmd = ["wfuzz", "-w", wordlist, arguments["target"]]
+        # wfuzz treats the first non-option positional as the payload-marked
+        # URL. Options (including --filter) must come before it, otherwise it
+        # is parsed as an extra payload and wfuzz dies with "Too many
+        # arguments". Keep the target last.
+        cmd = ["wfuzz", "-w", wordlist]
         methods = arguments.get("methods")
         if methods:
             cmd.extend(["-X", methods])
         filters = arguments.get("filters")
         if filters:
             cmd.extend(_filter_tokens(filters))
+        cmd.append(arguments["target"])
         return cmd
 
     def normalize(self, stdout: str, stderr: str, exit_code: int, **kwargs: Any) -> dict[str, Any]:

@@ -86,7 +86,9 @@ async def test_f06_foreach_shell_step_runs_command_and_filter_per_item(monkeypat
 
     async def fake_execute(cmd: Any, **kwargs: Any) -> ExecutionResult:
         commands.append(str(cmd))
-        return _fake_result("ITEM_alpha up")
+        # stdout echoes the iterated item so the filter capture differs per item.
+        item = str(cmd).rsplit(None, 1)[-1]
+        return _fake_result(f"ITEM_{item} up")
 
     monkeypatch.setattr(de, "gate_step_args", lambda *a, **kw: None)
     monkeypatch.setattr("kmcp.execution.engine.execute", fake_execute)
@@ -95,8 +97,9 @@ async def test_f06_foreach_shell_step_runs_command_and_filter_per_item(monkeypat
         id="echo",
         type="shell",
         command="echo ITEM_{item}",
-        inputs={"item": "alpha"},  # literal value; replaces {item} in command
-        filter={"type": "grep", "pattern": r"ITEM_(?P<tag>[a-z]+)", "first_only": True},
+        inputs={"item": "alpha"},  # literal input; under R-05 the foreach item
+        # wins, so {item} is bound to each iterated value, not inputs.item.
+        filter={"type": "grep", "pattern": r"ITEM_(?P<tag>[a-z0-9]+)", "first_only": True},
         foreach="discover.items",
         depends_on=["discover"],
     )
@@ -109,12 +112,14 @@ async def test_f06_foreach_shell_step_runs_command_and_filter_per_item(monkeypat
 
     assert res["count"] == 2
     # The defect dropped `command`, so execute() was never called at all.
-    assert commands == ["echo ITEM_alpha", "echo ITEM_alpha"]
-    for item in res["foreach_results"]:
+    # Under R-05 each iteration runs with the concrete foreach item.
+    assert commands == ["echo ITEM_host1", "echo ITEM_host2"]
+    expected = [("host1", "echo ITEM_host1"), ("host2", "echo ITEM_host2")]
+    for idx, item in enumerate(res["foreach_results"]):
         assert item.get("error") is None
-        assert item["command"] == "echo ITEM_alpha"
-        # `filter` survived the clone too.
-        assert item["tag"] == "alpha"
+        assert item["command"] == expected[idx][1]
+        # `filter` survived the clone and captured the per-item tag.
+        assert item["tag"] == expected[idx][0]
         assert item["match_count"] == 1
 
 
@@ -151,7 +156,8 @@ async def test_f06_foreach_clone_preserves_all_fields_and_clears_foreach(monkeyp
     assert len(seen) == 1
     clone = seen[0]
     assert clone.id == "probe_foreach"
-    assert clone.command == original.command
+    # R-05: {item} is substituted into the clone's command with the item value.
+    assert clone.command == "echo a"
     assert clone.inputs == original.inputs
     assert clone.filter == original.filter
     assert clone.budget == original.budget

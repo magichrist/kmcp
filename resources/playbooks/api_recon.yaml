@@ -13,10 +13,12 @@ inputs:
     properties:
       auth_token:
         type: string
-        description: "Bearer/API authentication token"
+        description: "Bearer/API authentication token (required for authenticated scans)"
+        required: true
       api_spec:
         type: string
         description: "OpenAPI/Swagger spec path or URL"
+        default: ""
 execution:
   max_parallel: 3
   timeout: 900

@@ -89,7 +89,9 @@ class PlaybookWebappTool(BaseTool):
                 "id": "ffuf",
                 "tool": "ffuf",
                 "depends_on": ["crawl"],
-                "args": {"target": "{{target}}", "wordlist": wordlist},
+                # target must carry the FUZZ placeholder; strip a trailing slash so
+                # "http://host:8000/" becomes "http://host:8000/FUZZ" not "//FUZZ".
+                "args": {"target": f"{t.rstrip('/')}/FUZZ", "wordlist": wordlist},
                 "parallel": True,
             },
             {
@@ -97,6 +99,7 @@ class PlaybookWebappTool(BaseTool):
                 "tool": "nuclei",
                 "depends_on": ["crawl", "params", "ffuf"],
                 "args": {"target": "{{target}}", "timeout": 900},
+                "budget": {"timeout": 900},
             },
             {
                 "id": "sqlmap",
@@ -110,6 +113,7 @@ class PlaybookWebappTool(BaseTool):
                 "tool": "commix",
                 "depends_on": ["params"],
                 "args": {"target": "{{target}}", "timeout": 900},
+                "budget": {"timeout": 900},
                 "parallel": True,
             },
             {

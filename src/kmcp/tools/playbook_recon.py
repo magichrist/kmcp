@@ -6,11 +6,21 @@ Defined in resources/playbooks/external_recon.yaml.
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Any
 
 from kmcp.tools.base import BaseTool
 from kmcp.tools.persist import wrap_execution_result
 from kmcp.validation import validate_required
+
+
+def _is_ip_address(t: str) -> bool:
+    """Return True when ``t`` is a bare IP address (subfinder needs a domain)."""
+    try:
+        ipaddress.ip_address(t)
+        return True
+    except ValueError:
+        return False
 
 
 class PlaybookReconTool(BaseTool):
@@ -72,37 +82,49 @@ class PlaybookReconTool(BaseTool):
         t = arguments["target"]
         steps = [
             {"id": "validate", "type": "scope_check", "args": {"target": t}},
-            {
-                "id": "discover",
-                "tool": "subfinder",
-                "depends_on": ["validate"],
-                "args": {"domain": "{{target}}"},
-            },
-            {
-                "id": "resolve",
-                "tool": "httpx",
-                "depends_on": ["discover"],
-                "args": {"target": "{{target}}"},
-            },
-            {
-                "id": "ports",
-                "tool": "masscan",
-                "depends_on": ["validate"],
-                "args": {"target": "{{target}}"},
-            },
-            {
-                "id": "technologies",
-                "tool": "whatweb",
-                "depends_on": ["resolve"],
-                "args": {"target": "{{target}}"},
-            },
-            {
-                "id": "nmap_scan",
-                "tool": "nmap",
-                "depends_on": ["ports"],
-                "args": {"target": "{{target}}", "scan_type": "-sV"},
-            },
         ]
+        # subfinder needs a domain name; for bare IP targets (e.g. 127.0.0.1)
+        # it rejects the input, so skip discovery and let httpx probe the target
+        # directly instead.
+        if not _is_ip_address(t):
+            steps.append(
+                {
+                    "id": "discover",
+                    "tool": "subfinder",
+                    "depends_on": ["validate"],
+                    "args": {"domain": "{{target}}"},
+                }
+            )
+        steps.extend(
+            [
+                {
+                    "id": "resolve",
+                    "tool": "httpx",
+                    # httpx probes the target directly; it does not depend on
+                    # subfinder output, so it runs for both domain and IP targets.
+                    "depends_on": ["validate"],
+                    "args": {"target": "{{target}}"},
+                },
+                {
+                    "id": "ports",
+                    "tool": "masscan",
+                    "depends_on": ["validate"],
+                    "args": {"target": "{{target}}"},
+                },
+                {
+                    "id": "technologies",
+                    "tool": "whatweb",
+                    "depends_on": ["resolve"],
+                    "args": {"target": "{{target}}"},
+                },
+                {
+                    "id": "nmap_scan",
+                    "tool": "nmap",
+                    "depends_on": ["ports"],
+                    "args": {"target": "{{target}}", "scan_type": "-sV"},
+                },
+            ]
+        )
         if not arguments.get("skip_nuclei"):
             steps.append(
                 {

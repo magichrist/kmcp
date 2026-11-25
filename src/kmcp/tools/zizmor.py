@@ -14,6 +14,21 @@ from kmcp.tools.base import BaseTool
 
 logger = logging.getLogger("kmcp.tools")
 
+# zizmor auto-discovers its GitHub token from the child process environment.
+# An empty GH_TOKEN is rejected by clap ("GitHub token cannot be empty"), so
+# empty credential variables must be removed from the inherited environment,
+# not merely omitted as an explicit --gh-token flag.
+_CREDENTIAL_ENV_VARS = ("GH_TOKEN", "GITHUB_TOKEN")
+
+
+def _sanitized_env() -> dict[str, str]:
+    """Copy the current environment, dropping empty credential variables."""
+    env = os.environ.copy()
+    for name in _CREDENTIAL_ENV_VARS:
+        if not env.get(name):
+            env.pop(name, None)
+    return env
+
 
 class ZizmorTool(BaseTool):
     @property
@@ -94,5 +109,5 @@ class ZizmorTool(BaseTool):
         timeout = arguments.get("timeout", self.default_timeout)
         cmd = self.build_command(arguments)
 
-        result = await engine.execute(cmd, tool=self.name, timeout=timeout)
+        result = await engine.execute(cmd, tool=self.name, timeout=timeout, env=_sanitized_env())
         return success_response(result)

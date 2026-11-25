@@ -13,7 +13,8 @@ inputs:
     properties:
       domain:
         type: string
-        description: "AD domain name"
+        description: "AD domain name (required for BloodHound/Kerberos steps)"
+        required: true
       protocol:
         type: string
         description: "SMB/Kerberos protocol (smb, ldap, rdp, ...)"

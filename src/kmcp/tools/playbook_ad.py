@@ -75,6 +75,9 @@ class PlaybookAdTool(BaseTool):
                 "tool": "enum4linux",
                 "depends_on": ["validate"],
                 "args": {"target": "{{target}}"},
+                # enum4linux fails on hosts without SMB; do not let it abort the
+                # whole AD chain (bloodhound/netexec/crackmapexec can still run).
+                "on_failure": "continue",
             },
             {
                 "id": "bloodhound",

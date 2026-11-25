@@ -6,24 +6,33 @@ The playbook engine resolves dependencies and executes modules in order.
 
 from __future__ import annotations
 
+import logging
 import os as _os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-PLAYBOOKS_DIR = Path(
-    _os.getenv("KALI_MCP_PLAYBOOKS_DIR", _PROJECT_ROOT / "resources" / "playbooks")
-)
-TEMPLATES_DIR = Path(
-    _os.getenv("KALI_MCP_TEMPLATES_DIR", _PROJECT_ROOT / "resources" / "playbooks")
-)
-CUSTOM_PLAYBOOKS_DIR = Path(
-    _os.getenv(
-        "KALI_MCP_CUSTOM_PLAYBOOKS_DIR", _PROJECT_ROOT / "resources" / "custom" / "playbooks"
-    )
-)
+logger = logging.getLogger("kmcp.playbooks.registry")
+
+# Packaged locations (always present in a wheel install):
+#   src/kmcp/playbooks/definitions/*.yaml   -> loadable playbooks
+#   src/kmcp/playbooks/templates/*.yaml     -> parameterized templates
+#   src/kmcp/playbooks/modules/*.yaml       -> engine modules (loaded elsewhere)
+_PACKAGE_DIR = Path(__file__).resolve().parent
+_PACKAGED_PLAYBOOKS_DIR = _PACKAGE_DIR / "definitions"
+_PACKAGED_TEMPLATES_DIR = _PACKAGE_DIR / "templates"
+
+# Resolve directories. Env vars win for advanced deployments; otherwise the
+# packaged dirs are used so template_list() / template_run() work after a
+# wheel install (the legacy resources/playbooks path does not exist there).
+_PLAYBOOKS_ENV = _os.getenv("KALI_MCP_PLAYBOOKS_DIR")
+_TEMPLATES_ENV = _os.getenv("KALI_MCP_TEMPLATES_DIR")
+_CUSTOM_PLAYBOOKS_ENV = _os.getenv("KALI_MCP_CUSTOM_PLAYBOOKS_DIR")
+
+PLAYBOOKS_DIR = Path(_PLAYBOOKS_ENV or _PACKAGED_PLAYBOOKS_DIR)
+TEMPLATES_DIR = Path(_TEMPLATES_ENV or _PACKAGED_TEMPLATES_DIR)
+CUSTOM_PLAYBOOKS_DIR = Path(_CUSTOM_PLAYBOOKS_ENV or _PACKAGE_DIR / "custom" / "playbooks")
 
 _playbooks: dict[str, dict[str, Any]] = {}
 _modules: dict[str, dict[str, Any]] = {}
@@ -81,12 +90,23 @@ def list_playbooks() -> list[dict[str, Any]]:
 def load_yaml_playbooks() -> None:
     """Load all YAML playbook definitions from the definitions directory."""
     if not PLAYBOOKS_DIR.exists():
+        logger.error(
+            "playbook definitions directory missing: %s (template_list/template_run "
+            "will be empty until it is created or KALI_MCP_PLAYBOOKS_DIR is set)",
+            PLAYBOOKS_DIR,
+        )
         return
+    found = 0
     for yml in sorted(PLAYBOOKS_DIR.glob("*.yaml")):
         with open(yml, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         if data and "id" in data:
             register_playbook(data["id"], data)
+            found += 1
+    if not found:
+        logger.warning(
+            "no playbook YAML definitions found in %s", PLAYBOOKS_DIR
+        )
 
 
 def load_yaml_modules() -> None:
@@ -139,14 +159,23 @@ def list_templates() -> list[dict[str, Any]]:
 
 def load_yaml_templates() -> None:
     """Load all YAML template definitions from the templates and custom directories."""
+    loaded = 0
     for directory in (TEMPLATES_DIR, CUSTOM_PLAYBOOKS_DIR):
         if not directory.exists():
+            logger.error(
+                "template directory missing: %s (template_list/template_run will be "
+                "empty until it is created or KALI_MCP_TEMPLATES_DIR is set)",
+                directory,
+            )
             continue
         for yml in sorted(directory.glob("*.yaml")):
             with open(yml, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f)
             if data and "id" in data:
                 register_template(data["id"], data)
+                loaded += 1
+    if not loaded:
+        logger.warning("no template YAML definitions found")
 
 
 def _merge_params(template: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:

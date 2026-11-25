@@ -297,6 +297,42 @@ def _lookup_external_job(job_id: str) -> tuple[str, dict[str, Any]] | None:
     return None
 
 
+def _entry_matches_job_id(entry: dict[str, Any], job_id: str) -> bool:
+    """Return True when a vault entry belongs to ``job_id``.
+
+    Assessment rows are keyed by assessment id, so the job id lives only in
+    the ``job:<id>`` tag and/or the JSON content (R-02). Name-only matching
+    cannot resolve those rows.
+    """
+    if not job_id or not isinstance(entry, dict):
+        return False
+
+    # Legacy/already-keyed rows: the job id is (part of) the row name.
+    name = str(entry.get("name") or "")
+    if name and (name == job_id or job_id in name):
+        return True
+
+    # vault stores tags as a comma-separated string; callers/tests may pass
+    # a list. Parse the explicit ``job:<id>`` marker in either form.
+    tags = entry.get("tags")
+    if isinstance(tags, str):
+        tag_parts: list[Any] = tags.split(",")
+    elif isinstance(tags, (list, tuple, set)):
+        tag_parts = list(tags)
+    else:
+        tag_parts = []
+    for part in tag_parts:
+        tag = str(part).strip()
+        if tag.startswith("job:") and tag[len("job:") :].strip() == job_id:
+            return True
+
+    # Content may be raw JSON text or an already-decoded dict.
+    content = entry.get("content")
+    if isinstance(content, dict):
+        content = json.dumps(content, default=str)
+    return isinstance(content, str) and bool(content) and job_id in content
+
+
 def _job_control_response(
     payload: dict[str, Any], *, success: bool = True, timed_out: bool = False
 ) -> dict[str, Any]:
@@ -1198,10 +1234,19 @@ class JobControlTool(BaseTool):
         entries = rows.get("entries", [])
         job_entry = None
         for e in entries:
-            name = e.get("name", "")
-            if job_id in name or job_id == name:
+            if _entry_matches_job_id(e, job_id):
                 job_entry = e
                 break
+            # vault_query returns row metadata only (no content); load the
+            # row so a job id stored solely in its JSON content still resolves.
+            if not e.get("content"):
+                try:
+                    content = vault_read(e.get("category", "assessments"), e.get("name", ""))
+                except Exception:  # noqa: BLE001 — unavailable row is not a match
+                    content = None
+                if _entry_matches_job_id({"content": content}, job_id):
+                    job_entry = e
+                    break
 
         if not job_entry:
             # Also check active engine executions

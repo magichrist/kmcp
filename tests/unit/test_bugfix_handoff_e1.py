@@ -214,7 +214,7 @@ _WFUZZ_ARGS = {"target": "http://x/FUZZ", "wordlist": "/w"}
 )
 def test_wfuzz_emits_filter_exactly_once(filters):
     cmd = WfuzzTool().build_command({**_WFUZZ_ARGS, "filters": filters})
-    assert cmd == ["wfuzz", "-w", "/w", "http://x/FUZZ", "--filter", "200"]
+    assert cmd == ["wfuzz", "-w", "/w", "--filter", "200", "http://x/FUZZ"]
     assert cmd.count("--filter") == 1
 
 
@@ -226,9 +226,9 @@ def test_wfuzz_preserves_quoted_filter_expression():
         "wfuzz",
         "-w",
         "/w",
-        "http://x/FUZZ",
         "--filter",
         "c=200 and c=404",
+        "http://x/FUZZ",
     ]
 
 
