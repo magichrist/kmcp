@@ -63,6 +63,9 @@ class AssessmentContext:
     evidence: dict[str, dict[str, Any]] = field(default_factory=dict)
     module_results: dict[str, Any] = field(default_factory=dict)
     execution_log: list[dict[str, Any]] = field(default_factory=list)
+    # Declared playbook inputs (with defaults) merged with the values supplied
+    # by the caller. Used by the engine to expand ``{{inputs.*}}`` references.
+    inputs: dict[str, Any] = field(default_factory=dict)
 
     def add_asset(self, asset: Asset) -> None:
         self.assets[asset.asset_id] = asset
@@ -137,12 +140,47 @@ class AssessmentContext:
             }
         )
 
+    def _execution_counts(self) -> tuple[str, int, int, int]:
+        """Derive (status, completed, failed, skipped) from actual execution state.
+
+        ``module_results`` holds successful module outputs; ``execution_log``
+        records failures, timeouts and skips. A module that failed on one
+        foreach iteration but later succeeded is counted only as completed.
+        """
+        completed = len(self.module_results)
+        succeeded = set(self.module_results)
+
+        failed_modules: set[str | None] = set()
+        skipped_modules: set[str | None] = set()
+        for entry in self.execution_log:
+            message = str(entry.get("message", ""))
+            module = entry.get("module")
+            if module in succeeded:
+                continue
+            if entry.get("level") == "error" or message.startswith(
+                ("error:", "timed out", "module not registered")
+            ):
+                failed_modules.add(module)
+            elif message.startswith("skipped"):
+                skipped_modules.add(module)
+
+        failed = len(failed_modules)
+        skipped = len(skipped_modules)
+        if failed and completed == 0:
+            status = "failed"
+        elif failed:
+            status = "partial"
+        else:
+            status = "completed"
+        return status, completed, failed, skipped
+
     def to_dict(self) -> dict[str, Any]:
+        status, completed, failed, skipped = self._execution_counts()
         return {
             "playbook": self.playbook_id,
             "assessment_id": self.assessment_id,
             "job_id": self.job_id,
-            "status": "completed",
+            "status": status,
             "target": self.target,
             "scope_id": self.scope_id,
             "profile": self.profile,
@@ -168,10 +206,11 @@ class AssessmentContext:
             "assets": [a.__dict__ for a in self.assets.values()],
             "evidence": self.evidence,
             "execution": {
+                "status": status,
                 "total_steps": len(self.execution_log),
-                "completed": len(self.module_results),
-                "failed": 0,
-                "skipped": 0,
+                "completed": completed,
+                "failed": failed,
+                "skipped": skipped,
                 "duration": 0.0,
             },
             "artifacts": list(self.evidence.keys()),
