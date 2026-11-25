@@ -60,13 +60,67 @@ def get_pending_approval(
     return db.get_pending_approval(gate=gate, resource_id=resource_id)
 
 
+def get_approved_approval(
+    db: DBManager,
+    gate: str,
+    resource_id: str,
+) -> dict[str, Any] | None:
+    """Return the newest *terminal* ``approved`` row for a gate/resource.
+
+    A pending row is a request, not a decision — only a row that an operator
+    explicitly moved to ``approved`` may authorize a gated action.
+    """
+    cur = db.conn.cursor()
+    row = cur.execute(
+        """
+        SELECT * FROM pending_approvals
+        WHERE gate=? AND resource_id=? AND status='approved'
+        ORDER BY id DESC LIMIT 1
+        """,
+        (gate, resource_id),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def is_approved(
     db: DBManager,
     gate: str,
     resource_id: str,
 ) -> bool:
-    """Return True when a pending approval exists for the gate/resource."""
-    return db.get_pending_approval(gate=gate, resource_id=resource_id) is not None
+    """Return True only when an operator has approved the gate/resource."""
+    return get_approved_approval(db, gate, resource_id) is not None
+
+
+def consume_approval(
+    db: DBManager,
+    gate: str,
+    resource_id: str,
+) -> bool:
+    """Atomically consume the newest approved row for a gate/resource.
+
+    A single conditional ``UPDATE`` is used so two concurrent publishes cannot
+    both consume the same approval (SQLite serializes the write). Returns
+    True when this caller claimed the approval.
+    """
+    cur = db.conn.cursor()
+    cur.execute(
+        """
+        UPDATE pending_approvals
+        SET status='consumed'
+        WHERE id = (
+            SELECT id FROM pending_approvals
+            WHERE gate=? AND resource_id=? AND status='approved'
+            ORDER BY id DESC LIMIT 1
+        )
+        AND status='approved'
+        """,
+        (gate, resource_id),
+    )
+    consumed = cur.rowcount > 0
+    if consumed:
+        db.conn.commit()
+        logger.info("APPROVAL consumed gate=%s resource=%s", gate, resource_id)
+    return consumed
 
 
 def approve(
@@ -78,8 +132,13 @@ def approve(
 ) -> bool:
     """Approve or reject a pending approval.
 
-    Returns True on success.
+    Only a row currently in ``pending`` state may be decided; terminal rows
+    (approved/rejected/consumed) are immutable. Returns True on success.
     """
+    cur = db.conn.cursor()
+    row = cur.execute("SELECT status FROM pending_approvals WHERE id=?", (approval_id,)).fetchone()
+    if row is None or row["status"] != "pending":
+        return False
     ok = db.approve(approval_id=approval_id, approved_by=approved_by, status=status)
     if ok:
         logger.info("APPROVAL %s id=%s by=%s", status, approval_id, approved_by)
@@ -111,6 +170,8 @@ __all__ = [
     "GATE_PUBLISH",
     "GATE_VISIBILITY_AGENT_CALLABLE",
     "approve",
+    "consume_approval",
+    "get_approved_approval",
     "get_pending_approval",
     "is_approved",
     "request_approval",

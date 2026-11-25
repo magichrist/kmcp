@@ -31,7 +31,11 @@ class TestApprovals:
 
     def test_is_approved(self, db):
         assert approvals.is_approved(db, "publish", "pb1") is False
-        approvals.request_approval(db, gate="publish", resource_id="pb1")
+        aid = approvals.request_approval(db, gate="publish", resource_id="pb1")
+        # A pending request is not an approval (BUG-003).
+        assert approvals.is_approved(db, "publish", "pb1") is False
+        approvals.approve(db, approval_id=aid, approved_by="bob")
+        # Only a terminal approved row authorizes the gate.
         assert approvals.is_approved(db, "publish", "pb1") is True
 
     def test_approve(self, db):
