@@ -192,9 +192,9 @@ def test_no_agent_context_unchanged_legacy_surface(patch_db):
     _SEEN_CALLS.clear()
     assert agent_context.get_current_profile() is None
 
-    # Catalog serves the legacy black-box registry, not the Studio playbook
+    # With no profile, published Studio playbooks are merged with builtins (F-03)
     catalog = _payload_text(_run(PlaybookCatalogTool().execute({})))
-    assert "pb.flow" not in {p["id"] for p in catalog["playbooks"]}
+    assert "pb.flow" in {p["id"] for p in catalog["playbooks"]}
 
     # Studio playbook ids are resolved via the Studio path — operator context
     run_res = _run(PlaybookRunTool().execute({"playbook": "pb.flow", "target": "flow.example.org"}))

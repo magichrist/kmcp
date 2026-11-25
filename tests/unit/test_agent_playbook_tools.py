@@ -251,10 +251,10 @@ class TestPlaybookCatalogProfile:
 
         _seed_published(patch_db)  # studio playbook exists but no profile context
         resp = _payload_text(_run(PlaybookCatalogTool().execute({})))
-        ids = [p["id"] for p in resp["playbooks"]]
-        assert "pb.studio" not in ids
-        legacy_ids = {p["id"] for p in pb_registry.list_playbooks()}
-        assert set(ids) == legacy_ids
+        ids = {p["id"] for p in resp["playbooks"]}
+        # No profile → published Studio playbooks are merged with builtins (F-03).
+        assert "pb.studio" in ids
+        assert {p["id"] for p in pb_registry.list_playbooks()} <= ids
 
 
 class TestPlaybookResultStudio:

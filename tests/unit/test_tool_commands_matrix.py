@@ -251,7 +251,7 @@ def test_john_format_wordlist_show():
             "show": True,
         }
     )
-    assert cmd[cmd.index("--format") + 1] == "raw-sha1"
+    assert "--format=raw-sha1" in cmd
     assert "--wordlist" in cmd and "--show" in cmd
     assert cmd[-1] == "/h"
 

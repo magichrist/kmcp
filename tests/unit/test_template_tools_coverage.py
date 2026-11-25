@@ -157,27 +157,30 @@ class TestTemplateRunTool:
         with patch("kmcp.playbooks.registry.get_template", return_value={"id": "t"}):
             tool.validate({"template_id": "t", "params": {}})
 
-    async def test_execute_render_template_not_found_propagates(self):
+    async def test_execute_render_template_not_found_returns_structured_error(self):
         tool = TemplateRunTool()
-        with (
-            patch(
-                "kmcp.playbooks.registry.render_template",
-                side_effect=TemplateNotFound("missing"),
-            ),
-            pytest.raises(TemplateNotFound),
+        with patch(
+            "kmcp.playbooks.registry.render_template",
+            side_effect=TemplateNotFound("missing"),
         ):
-            await tool.execute({"template_id": "missing", "params": {}})
+            result = await tool.execute({"template_id": "missing", "params": {}})
+        assert result["isError"] is True
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is False
+        assert payload["error_type"] == "TemplateNotFound"
+        assert "missing" in payload["error"]
 
-    async def test_execute_render_playbook_error_becomes_value_error(self):
+    async def test_execute_render_playbook_error_returns_structured_error(self):
         tool = TemplateRunTool()
-        with (
-            patch(
-                "kmcp.playbooks.registry.render_template",
-                side_effect=PlaybookError("bad playbook"),
-            ),
-            pytest.raises(ValueError, match="template produced an invalid playbook"),
+        with patch(
+            "kmcp.playbooks.registry.render_template",
+            side_effect=PlaybookError("bad playbook"),
         ):
-            await tool.execute({"template_id": "t", "params": {}})
+            result = await tool.execute({"template_id": "t", "params": {}})
+        assert result["isError"] is True
+        payload = json.loads(result["content"][0]["text"])
+        assert payload["success"] is False
+        assert "invalid playbook" in payload["error"]
 
     async def test_execute_foreground_success(self):
         tool = TemplateRunTool()
@@ -216,10 +219,12 @@ class TestTemplateRunTool:
                 "kmcp.workflow.dag_executor.run_playbook_async",
                 side_effect=RuntimeError("engine boom"),
             ),
-            pytest.raises(RuntimeError, match="engine boom"),
         ):
-            await tool.execute({"template_id": "t", "params": {}})
+            result = await tool.execute({"template_id": "t", "params": {}})
 
+        assert result["isError"] is True
+        payload = json.loads(result["content"][0]["text"])
+        assert "engine boom" in payload["error"]
         assert len(JOB_REGISTRY) == 1
         entry = next(iter(JOB_REGISTRY.values()))
         assert entry["status"] == "failed"
@@ -250,4 +255,4 @@ class TestTemplateRunTool:
             result = await tool.safe_execute({"template_id": "t", "params": {}})
         assert result["isError"] is True
         payload = json.loads(result["content"][0]["text"])
-        assert payload["error"] == "Internal error in template_run"
+        assert payload["error"] == "ValueError: render boom"
