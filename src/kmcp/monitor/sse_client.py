@@ -71,14 +71,21 @@ class SseClient:
                                 except asyncio.QueueEmpty:
                                     pass
                                 self._queue.put_nowait(payload)
-            except (httpx.ConnectError, httpx.ReadError, OSError):
-                # Server went down — retry after a short pause
-                self._last_error = "Connection refused — is the server running?"
-                await asyncio.sleep(2.0)
             except httpx.HTTPStatusError as exc:
                 # 401/403 etc — auth problem, keep retrying so a token change
                 # or server restart recovers without restarting the TUI.
                 self._last_error = f"HTTP {exc.response.status_code} — check your MCP_API_TOKEN"
+                await asyncio.sleep(2.0)
+            except (httpx.ConnectError, httpx.ReadError, OSError):
+                # Server went down — retry after a short pause
+                self._last_error = "Connection refused — is the server running?"
+                await asyncio.sleep(2.0)
+            except httpx.HTTPError as exc:
+                # A server restart mid-stream closes the connection abruptly
+                # (RemoteProtocolError) or stalls it (ReadTimeout). Neither is a
+                # subclass of ConnectError/ReadError, so catch HTTPError broadly
+                # and keep the reconnect loop alive with the same backoff.
+                self._last_error = f"Stream error: {exc} — reconnecting"
                 await asyncio.sleep(2.0)
             except asyncio.CancelledError:
                 return
