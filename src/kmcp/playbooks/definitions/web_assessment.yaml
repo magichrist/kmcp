@@ -10,11 +10,18 @@ inputs:
   options:
     type: object
     description: "Optional assessment options"
+    default:
+      wordlist: "/usr/share/wordlists/dirb/common.txt"
+      domain: ""
     properties:
       wordlist:
         type: string
         description: "Wordlist for ffuf directory brute-forcing"
         default: "/usr/share/wordlists/dirb/common.txt"
+      domain:
+        type: string
+        description: "Domain-only target for subfinder; empty skips subdomain discovery (raw IP/URL targets)"
+        default: ""
 execution:
   max_parallel: 4
   timeout: 900
@@ -28,10 +35,11 @@ steps:
   - id: discover
     module: subfinder
     depends_on: [validate]
+    when: "inputs.options.domain != ''"
     args:
-      domain: "{{target}}"
+      domain: "{{options.domain}}"
     checkpoint: true
-    description: "Discover subdomains via subfinder"
+    description: "Discover subdomains via subfinder (domain-only; skipped for raw IP/URL targets)"
   - id: resolve
     module: httpx
     depends_on: [discover]
@@ -58,17 +66,23 @@ steps:
     module: ffuf
     depends_on: [map]
     args:
-      target: "{{target}}"
-      wordlist: "{{options.wordlist}}"
+      target: "{{target}}/FUZZ"
+      wordlist: "/usr/share/wordlists/dirb/common.txt"
+      filter: ""
+      extra_args: ""
     parallel: true
     checkpoint: true
-    description: "Brute-force directories and paths via ffuf"
+    description: "Brute-force directories and paths via ffuf (FUZZ placeholder required)"
   - id: vulnerability_checks
     module: nuclei
     depends_on: [params, dirs]
     args:
       target: "{{target}}"
       templates: "http"
+      severity: ""
+      extra_args: ""
+      timeout: 900
+    timeout: 900
     checkpoint: true
     description: "Scan web endpoints with nuclei"
   - id: correlate

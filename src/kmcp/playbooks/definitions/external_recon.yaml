@@ -10,11 +10,18 @@ inputs:
   options:
     type: object
     description: "Optional assessment options"
+    default:
+      ports: "1-1000"
+      domain: ""
     properties:
       ports:
         type: string
-        description: "Port range for nmap/masscan"
+        description: "Port range for nmap/masscan (default: 1-1000)"
         default: "1-1000"
+      domain:
+        type: string
+        description: "Domain-only target for subfinder; empty skips subdomain discovery (raw IP targets)"
+        default: ""
 execution:
   max_parallel: 3
   timeout: 900
@@ -28,10 +35,11 @@ steps:
   - id: discover
     module: subfinder
     depends_on: [validate]
+    when: "inputs.options.domain != ''"
     args:
-      domain: "{{target}}"
+      domain: "{{options.domain}}"
     checkpoint: true
-    description: "Discover subdomains via subfinder"
+    description: "Discover subdomains via subfinder (domain-only; skipped for raw IP targets)"
   - id: resolve
     module: httpx
     depends_on: [discover]
@@ -44,10 +52,11 @@ steps:
     depends_on: [validate]
     args:
       target: "{{target}}"
-      ports: "{{options.ports}}"
+      ports: "1-1000"
+      extra_args: ""
     parallel: true
     checkpoint: true
-    description: "Enumerate open ports via nmap"
+    description: "Enumerate open ports via nmap (masscan rejects hostname targets)"
   - id: technologies
     module: whatweb
     depends_on: [resolve]
@@ -62,6 +71,8 @@ steps:
     args:
       target: "{{target}}"
       templates: "http"
+      severity: ""
+      extra_args: ""
     checkpoint: true
     description: "Scan resolved services with nuclei"
   - id: correlate

@@ -33,8 +33,9 @@ steps:
     depends_on: [validate]
     args:
       target: "{{target}}"
+    on_failure: continue
     checkpoint: true
-    description: "Enumerate AD domain via enum4linux"
+    description: "Enumerate AD domain via enum4linux (non-fatal so downstream steps still run)"
   - id: kerberos
     module: kerberos
     depends_on: [enum]

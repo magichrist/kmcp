@@ -10,6 +10,9 @@ inputs:
   options:
     type: object
     description: "Optional assessment options"
+    default:
+      ports: "1-1000"
+      rate: "500"
     properties:
       ports:
         type: string
@@ -34,7 +37,8 @@ steps:
     depends_on: [validate]
     args:
       target: "{{target}}"
-      ports: "{{inputs.options.ports}}"
+      ports: "1-1000"
+      extra_args: ""
     checkpoint: true
     description: "Discover open ports and services via nmap"
   - id: resolve
@@ -49,8 +53,9 @@ steps:
     depends_on: [discover]
     args:
       target: "{{target}}"
-      ports: "{{inputs.options.ports}}"
-      rate: "{{inputs.options.rate}}"
+      ports: "1-1000"
+      rate: "500"
+      extra_args: ""
     parallel: true
     checkpoint: true
     description: "Enumerate ports via the ports module (nmap)"
@@ -59,7 +64,7 @@ steps:
     depends_on: [resolve, ports]
     args:
       target: "{{target}}"
-      ports: "{{inputs.options.ports}}"
+      ports: "1-1000"
       extra_args: "-sV -sC"
     checkpoint: true
     description: "Service and version enumeration on resolved hosts"
