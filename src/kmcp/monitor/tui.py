@@ -64,6 +64,17 @@ def _panel_name(panel: int) -> str:
     return "Sessions" if panel == PANEL_SESSIONS else "Jobs"
 
 
+_NORMAL_STATUS_MSG = (
+    "q: quit · r: refresh · f: force cleanup · k k: kill selected · "
+    "←→: switch panel · ↑↓: move selection"
+)
+
+
+def _status_after_snapshot(status_msg: str, conn_err: str | None) -> str:
+    """Reset the status bar to normal help once the SSE stream recovers."""
+    return status_msg if conn_err else _NORMAL_STATUS_MSG
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Panel builders (with optional row highlight)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -211,8 +222,13 @@ def build_layout(
 # ═════════════════════════════════════════════════════════════════════════════
 
 
-async def _http_post(base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    async with httpx.AsyncClient(timeout=10.0) as http:
+async def _http_post(
+    base_url: str,
+    payload: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """POST a monitor action, forwarding the SSE bearer token when present."""
+    async with httpx.AsyncClient(timeout=10.0, headers=headers or {}) as http:
         resp = await http.post(f"{base_url}/monitor/action", json=payload)
         resp.raise_for_status()
         return resp.json()
@@ -223,6 +239,7 @@ async def _kill_selected(
     panel: int,
     index: int,
     snapshot: dict[str, Any] | None,
+    headers: dict[str, str] | None = None,
 ) -> str:
     """Kill the currently selected job/session. Returns a status message."""
     if snapshot is None:
@@ -236,7 +253,9 @@ async def _kill_selected(
         if not req_id:
             return "No request id for selected job"
         try:
-            res = await _http_post(base_url, {"action": "kill_job", "request_id": req_id})
+            res = await _http_post(
+                base_url, {"action": "kill_job", "request_id": req_id}, headers=headers
+            )
             if res.get("killed"):
                 return f"Killed job {req_id}"
             return f"Job {req_id}: not found"
@@ -315,10 +334,7 @@ async def run(url: str, token: str | None = None) -> None:
     snapshot = client.get_latest_snapshot() or {}
     # Show connection error if the SSE stream is failing
     conn_err = client.last_error
-    status_msg = (
-        "q: quit · r: refresh · f: force cleanup · k k: kill selected · "
-        "←→: switch panel · ↑↓: move selection"
-    )
+    status_msg = _NORMAL_STATUS_MSG
     if conn_err:
         status_msg = f"Connection error: {conn_err} · q: quit · r: retry"
     layout = build_layout(snapshot, status_msg, panel, index)
@@ -341,13 +357,9 @@ async def run(url: str, token: str | None = None) -> None:
                 # ── New snapshot from SSE ──────────────────────────────
                 if isinstance(result, dict):
                     snapshot = result
-                    # Clear connection error once data flows again
-                    conn_err = client.last_error
-                    if conn_err:
-                        status_msg = (
-                            "q: quit · r: refresh · f: force cleanup · k k: kill selected · "
-                            "←→: switch panel · ↑↓: move selection"
-                        )
+                    # Clear connection error once data flows again (the SSE
+                    # reader resets last_error on a successful connection).
+                    status_msg = _status_after_snapshot(status_msg, client.last_error)
                     layout = build_layout(
                         snapshot,
                         status_msg,
@@ -452,7 +464,7 @@ async def run(url: str, token: str | None = None) -> None:
 
                 elif key == "f":
                     try:
-                        res = await _http_post(f"{url}/monitor/action", {"action": "force_cleanup"})
+                        res = await _http_post(url, {"action": "force_cleanup"}, headers=headers)
                         status_msg = f"force_cleanup: {res.get('cleaned', 0)} cleaned"
                     except Exception as exc:  # noqa: BLE001
                         status_msg = f"force_cleanup: error — {exc}"
@@ -464,7 +476,9 @@ async def run(url: str, token: str | None = None) -> None:
                     if now - last_k_time <= DOUBLE_TAP_WINDOW:
                         # Double-tap → kill the selected item
                         last_k_time = 0.0
-                        kill_msg = await _kill_selected(url, panel, index, snapshot)
+                        kill_msg = await _kill_selected(
+                            url, panel, index, snapshot, headers=headers
+                        )
                         status_msg = kill_msg
                         layout = build_layout(snapshot, status_msg, panel, index)
                         live.update(layout, refresh=True)
