@@ -72,8 +72,19 @@ def _project_root() -> Path:
 
 
 def _load_env() -> None:
-    """Load .env from the repo root (idempotent)."""
-    load_dotenv(str(REPO_ROOT / ".env"), override=False)
+    """Load .env from the active project root (idempotent).
+
+    ``cmd_start`` writes and reads ``<cwd>/.env``; commands such as ``monitor``,
+    ``studio`` and ``purge`` must resolve the same file. After a non-editable
+    install ``REPO_ROOT`` points into site-packages, so loading only that path
+    silently drops MCP_API_TOKEN (and other settings) for those commands.
+    The cwd file is loaded first and wins; the package-root file remains a
+    fallback for editable/source checkouts.
+    """
+    root = _project_root()
+    load_dotenv(str(root / ".env"), override=False)
+    if REPO_ROOT != root:
+        load_dotenv(str(REPO_ROOT / ".env"), override=False)
 
 
 # ── embedded .env.example (shipped with the package) ───────────────────────

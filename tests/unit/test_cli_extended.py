@@ -103,6 +103,22 @@ class TestCmdMonitor:
             cmd_monitor(args)
             mock_monitor_main.assert_called_once_with("http://127.0.0.1:8399", None)
 
+    def test_cmd_monitor_loads_api_token_from_cwd_env(self, tmp_path, monkeypatch) -> None:
+        """Monitor must read the same <cwd>/.env that `kmcp start` writes."""
+        (tmp_path / ".env").write_text(
+            "MCP_API_TOKEN=monitor-token-123\nMCP_MONITOR_URL=http://127.0.0.1:9999\n",
+            encoding="utf-8",
+        )
+        monkeypatch.chdir(tmp_path)
+        with (
+            patch("kmcp.monitor.tui.main") as mock_monitor_main,
+            patch.dict(os.environ, {}, clear=True),
+        ):
+            assert cmd_monitor(SimpleNamespace(url=None)) == 0
+            mock_monitor_main.assert_called_once_with(
+                "http://127.0.0.1:9999", "monitor-token-123"
+            )
+
 
 class TestCmdPurgeExtended:
     def _make_args(self, scope="all", confirm=True) -> SimpleNamespace:
