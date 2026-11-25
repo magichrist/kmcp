@@ -127,18 +127,24 @@ class TestDiscoverAndImport:
 
 
 class TestTestConnection:
-    def test_returns_true_on_success(self):
+    async def test_returns_true_on_success(self):
         client = AsyncMock()
         client.list_tools = AsyncMock(return_value=[])
-        assert smc.test_connection(client) is True
+        result = await smc.test_connection(client)
+        assert result["ok"] is True
+        assert result["healthy"] is True
         client.list_tools.assert_awaited_once()
 
-    def test_returns_false_when_list_tools_fails(self):
+    async def test_returns_false_when_list_tools_fails(self):
         client = AsyncMock()
         client.list_tools = AsyncMock(side_effect=MCPClientError("down"))
-        assert smc.test_connection(client) is False
+        result = await smc.test_connection(client)
+        assert result["ok"] is False
+        assert "down" in result["error"]
 
-    def test_returns_false_when_connect_fails(self):
+    async def test_returns_false_when_connect_fails(self):
         client = AsyncMock()
         client.__aenter__ = AsyncMock(side_effect=MCPClientError("connect failed"))
-        assert smc.test_connection(client) is False
+        result = await smc.test_connection(client)
+        assert result["ok"] is False
+        assert "connect failed" in result["error"]

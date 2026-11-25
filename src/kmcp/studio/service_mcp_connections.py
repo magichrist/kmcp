@@ -52,19 +52,30 @@ async def discover_and_import(
         raise
 
 
-def test_connection(client: ExternalMCPClient) -> bool:
-    """Best-effort connectivity check."""
+async def test_connection(client: ExternalMCPClient) -> dict[str, Any]:
+    """Probe an external MCP server without nesting an event loop.
+
+    Returns a structured result instead of a bare bool so the API can report
+    *why* a connection failed. Errors are redacted before being returned.
+    """
+    from kmcp.studio.redaction import redact_log
+
     try:
-        import asyncio
-
-        async def _probe() -> bool:
-            async with client:
-                await client.list_tools()
-            return True
-
-        return asyncio.run(_probe())
-    except Exception:  # noqa: BLE001
-        return False
+        async with client:
+            tools = await client.list_tools()
+        return {
+            "ok": True,
+            "healthy": True,
+            "tool_count": len(tools) if isinstance(tools, list) else None,
+            "error": None,
+        }
+    except Exception as exc:  # noqa: BLE001 — probe failures are expected
+        return {
+            "ok": False,
+            "healthy": False,
+            "tool_count": None,
+            "error": redact_log(f"{type(exc).__name__}: {exc}"),
+        }
 
 
 __all__ = ["add_connection", "discover_and_import", "test_connection"]
