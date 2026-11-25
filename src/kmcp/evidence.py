@@ -68,22 +68,30 @@ def store_evidence(
     """
     evidence_id = f"evidence_{uuid.uuid4().hex[:12]}"
 
-    # Determine storage path
+    # Determine storage path. Every caller-controlled component is sanitized
+    # and the resolved directory is verified to stay under the evidence root
+    # before anything is written (BUG-004: assessment_id / artifact_type were
+    # interpolated raw, allowing absolute paths and ``..`` traversal).
     if content_path is None:
         safe_target = _sanitize_fs(target)
         safe_tool = _sanitize_fs(tool)
-        base_dir = _evidence_dir()
-        rel_dir = base_dir / f"{assessment_id or 'no-assessment'}"
-        rel_dir = rel_dir / f"{safe_tool}_{safe_target}"
-        full_dir = rel_dir
+        safe_assessment = _sanitize_fs(str(assessment_id)) if assessment_id else "no-assessment"
+        safe_artifact_type = _sanitize_fs(str(artifact_type))
+        base_dir = _evidence_dir().resolve()
+        full_dir = (base_dir / safe_assessment / f"{safe_tool}_{safe_target}").resolve()
+        if not full_dir.is_relative_to(base_dir):
+            full_dir = base_dir / "unsanitized"
         full_dir.mkdir(parents=True, exist_ok=True)
-        content_path = str(full_dir / f"{evidence_id}_{artifact_type}.txt")
+        content_path = str(full_dir / f"{evidence_id}_{safe_artifact_type}.txt")
 
     # Write content to disk
     try:
-        Path(content_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(content_path).write_text(content, encoding="utf-8")
-    except OSError:
+        resolved_path = Path(content_path).resolve()
+        if not resolved_path.is_relative_to(_evidence_dir().resolve()):
+            return evidence_id
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path.write_text(content, encoding="utf-8")
+    except (OSError, ValueError):
         pass
 
     # Record in SQLite
