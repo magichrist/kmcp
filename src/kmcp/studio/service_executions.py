@@ -14,6 +14,7 @@ import logging
 from typing import Any
 
 from kmcp.db.manager import DBManager
+from kmcp.studio.redaction import redact_step_outputs
 
 logger = logging.getLogger("kmcp.studio.service_executions")
 
@@ -44,8 +45,8 @@ def list_executions(
     out = []
     for r in rows:
         r = dict(r)
-        r["inputs"] = _loads_if_str(r.get("inputs"))
-        r["outputs"] = _loads_if_str(r.get("outputs"))
+        r["inputs"] = redact_step_outputs(_loads_if_str(r.get("inputs")))
+        r["outputs"] = redact_step_outputs(_loads_if_str(r.get("outputs")))
         out.append(r)
     return out
 
@@ -76,14 +77,14 @@ def get_execution(db: DBManager, execution_id: str) -> dict[str, Any] | None:
         data.pop(key, None)
     # inputs/outputs are stored as JSON strings in SQLite; parse them back so
     # the API returns real objects instead of double-encoded strings.
-    data["inputs"] = _loads_if_str(data.get("inputs"))
-    data["outputs"] = _loads_if_str(data.get("outputs"))
+    data["inputs"] = redact_step_outputs(_loads_if_str(data.get("inputs")))
+    data["outputs"] = redact_step_outputs(_loads_if_str(data.get("outputs")))
     steps = []
     for s in list_steps(db, execution_id):
         s = dict(s)
         for key in ("id", "execution_id", "step_type", "inputs"):
             s.pop(key, None)
-        s["outputs"] = _loads_if_str(s.get("outputs"))
+        s["outputs"] = redact_step_outputs(_loads_if_str(s.get("outputs")))
         steps.append(s)
     data["steps"] = steps
     data["artifacts"] = list_artifacts(db, execution_id)
@@ -131,15 +132,90 @@ def cancel_execution(db: DBManager, execution_id: str) -> bool:
     return updated
 
 
-def resume_execution(db: DBManager, execution_id: str) -> dict[str, Any] | None:
-    """Return the persisted run so the engine can resume from checkpoint."""
-    run = db.load_workflow_run(execution_id)
-    if run is None:
+async def resume_execution(db: DBManager, execution_id: str) -> dict[str, Any] | None:
+    """Resume a failed/interrupted execution from its workflow checkpoint.
+
+    Loads the original published definition and inputs, seeds the engine's
+    checkpoint registry, and awaits ``run_playbook_async(..., resume=True)``.
+    Never reports success without actually dispatching to the engine.
+    """
+    cur = db.conn.cursor()
+    row = cur.execute(
+        "SELECT playbook_id, version_id, inputs, status FROM workflow_executions "
+        "WHERE execution_id=?",
+        (execution_id,),
+    ).fetchone()
+    if row is None:
         return None
+    if row["status"] not in ("running", "failed", "partial", "aborted", "cancelled"):
+        raise ValueError(f"execution {execution_id!r} is {row['status']!r} and cannot be resumed")
+
+    playbook_id = row["playbook_id"]
+    pb = db.get_playbook(playbook_id)
+    if pb is None:
+        raise LookupError(f"playbook {playbook_id!r} not found")
+    version_id = row["version_id"] or pb.get("current_version_id")
+    version = db.get_playbook_version(version_id) if version_id else None
+    if version is None:
+        raise LookupError(f"no published version found for execution {execution_id!r}")
+    definition = version.get("definition")
+    if isinstance(definition, str):
+        try:
+            definition = json.loads(definition)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid stored definition: {exc}") from exc
+
+    # Lazy import: Studio must not force the workflow package at import time.
+    from kmcp.workflow.dag_executor import RUN_STATUS, run_playbook_async
+    from kmcp.workflow.yaml_loader import load_playbook
+
+    defn = load_playbook(definition)
+    checkpoint = db.load_workflow_run(execution_id) or db.load_workflow_run(defn.name)
+    if checkpoint is not None:
+        state = dict(checkpoint.get("state") or {})
+        state["status"] = checkpoint.get("status", state.get("status", "aborted"))
+        state["completed_steps"] = checkpoint.get(
+            "completed_steps", state.get("completed_steps", [])
+        )
+        # The engine only skips completed steps when the prior run is terminal.
+        # An interrupted checkpoint is often left as "running", so normalize it.
+        if state.get("status") not in ("completed", "failed", "aborted", "partial"):
+            state["status"] = "aborted"
+        RUN_STATUS[defn.name] = state
+    elif not RUN_STATUS.get(defn.name):
+        raise ValueError(f"no checkpoint available for execution {execution_id!r}")
+
+    inputs = _loads_if_str(row["inputs"]) or {}
+    if isinstance(inputs, dict):
+        _merge_required_inputs(defn, inputs)
+
+    res = await run_playbook_async(defn, resume=True)
+    try:
+        payload = json.loads(res.stdout or "{}") or {}
+    except (TypeError, ValueError):
+        payload = {
+            "status": "completed" if res.success else "failed",
+            "results": [],
+            "step_results": {},
+        }
+    status = payload.get("status") or ("completed" if res.success else "failed")
+    db.update_workflow_execution(
+        execution_id,
+        status=status,
+        outputs={
+            "results": payload.get("results"),
+            "summary": payload.get("summary") or payload.get("steps", []),
+        },
+        completed_at=db._now_utc(),
+    )
     exec_row = get_execution(db, execution_id)
-    if exec_row is None:
-        return None
-    return {"execution": exec_row, "checkpoint": run}
+    return {
+        "execution": exec_row,
+        "status": status,
+        "resumed": True,
+        "checkpoint_used": checkpoint is not None,
+        "payload": redact_step_outputs(payload),
+    }
 
 
 # ── Start execution (Phase 7 / 08_FILE_PLAN: "start (delegates to engine)") ─
@@ -359,8 +435,8 @@ async def start_execution(
                     step_id,
                     tool_id=str(step_res.get("tool")) if step_res.get("tool") else None,
                     status="failed" if step_error else "completed",
-                    error=str(step_error) if step_error else None,
-                    outputs=_extract_step_outputs(step_res),
+                    error=redact_step_outputs(str(step_error)) if step_error else None,
+                    outputs=redact_step_outputs(_extract_step_outputs(step_res)),
                     started_at=db._now_utc(),
                     completed_at=db._now_utc(),
                 )
@@ -373,7 +449,7 @@ async def start_execution(
         "job_id": job_id,
         "assessment_id": assessment_id,
         "status": status,
-        "payload": payload,
+        "payload": redact_step_outputs(payload),
     }
 
 
