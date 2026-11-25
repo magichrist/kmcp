@@ -15,11 +15,11 @@ init:
 
 # Start the server (foreground)
 start:
-    python -m kmcp
+    python -m kmcp start
 
 # Start in debug mode
 debug:
-    MCP_DEBUG=true python -m kmcp
+    MCP_DEBUG=true python -m kmcp start
 
 # Run the full pytest suite (unit + integration)
 test:
