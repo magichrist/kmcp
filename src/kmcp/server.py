@@ -312,119 +312,159 @@ for tool_instance in ALL_TOOLS:
         async def handler(ctx: Context, **kwargs) -> str:
             request_id = uuid.uuid4().hex[:12]
             health.record_request()
-            # ── Agent profile resolution + per-call enforcement ────────
-            # Resolve the profile from the request headers (no header → no
-            # agent context → unchanged default behavior). When a profile IS
-            # resolved, every tool call is deny-by-default checked against
-            # its agent_tool_permissions grants (07_SECURITY §Layer 2).
             profile_token = None
-            profile_ctx = None
+            # One try/finally around the *whole* body: the early deny/scope
+            # returns below must not leave a stale profile in the ContextVar.
             try:
-                profile_ctx = agent_context.resolve_from_context(ctx)
-            except Exception:  # BLE001 tolerated — resolution must never crash the dispatch
-                logger.debug("agent profile resolution failed", exc_info=True)
-                profile_ctx = None
-            if profile_ctx:
-                profile_token = agent_context.set_current_profile(profile_ctx)
-                if not agent_context.can_call_tool(profile_ctx, t.name):
+                # ── Agent profile resolution + per-call enforcement ────────
+                # Resolve the profile from the request headers (no header → no
+                # agent context → unchanged default behavior). When a profile IS
+                # resolved, every tool call is deny-by-default checked against
+                # its agent_tool_permissions grants (07_SECURITY §Layer 2).
+                try:
+                    profile_ctx = agent_context.resolve_from_context(ctx)
+                except Exception:  # BLE001 tolerated — resolution must never crash the dispatch
+                    logger.debug("agent profile resolution failed", exc_info=True)
+                    profile_ctx = None
+
+                # MCP_AGENT_PROFILE_ID is mandatory by config contract. A bound
+                # profile that is missing/unresolvable must deny every call —
+                # falling through to client headers would be a privilege
+                # escalation (fail-open).
+                if agent_context.bound_profile_invalid():
+                    health.record_error()
+                    bound = getattr(config, "agent_profile_id", "")
+                    emit_log(ctx, "warning", f"Invalid bound agent profile ({request_id})")
+                    return agent_context.forbidden_profile_payload(str(bound))
+
+                if profile_ctx:
+                    profile_token = agent_context.set_current_profile(profile_ctx)
+                    if not agent_context.can_call_tool(profile_ctx, t.name):
+                        health.record_error()
+                        emit_log(
+                            ctx,
+                            "warning",
+                            f"Forbidden {t.name} for profile {profile_ctx} ({request_id})",
+                        )
+                        return agent_context.forbidden_tool_payload(t.name, profile_ctx)
+
+                # ── Tool visibility enforcement (BUG-021) ──────────────────
+                # Studio can demote a tool to playbook_selectable/internal/
+                # hidden. Such tools must not be callable directly via MCP,
+                # even when the agent profile holds an explicit grant.
+                definition = registry.get_definition(t.name)
+                if definition is not None and definition.visibility != "agent_callable":
                     health.record_error()
                     emit_log(
                         ctx,
                         "warning",
-                        f"Forbidden {t.name} for profile {profile_ctx} ({request_id})",
+                        f"Tool {t.name} has visibility {definition.visibility} ({request_id})",
                     )
-                    return agent_context.forbidden_tool_payload(t.name, profile_ctx)
-            # ── Scope enforcement (Phase 1 Foundation) ──────────────────
-            # Every tool call passes through the server-side scope check
-            # before it is dispatched to the tool implementation.
-            tool_name = t.name
-            target = extract_target(kwargs)
-            try:
-                check_scope(target, tool_name)
-            except ValueError as exc:
-                health.record_error()
-                emit_log(
-                    ctx,
-                    "warning",
-                    f"Scope violation {tool_name} ({request_id}): {exc}",
-                )
-                return json.dumps({"error": str(exc), "scope_violation": True}, indent=2)
-            # ── Assessment / job context ────────────────────────────────
-            # Opaque handles stored on scans / evidence rows for traceability.
-            assessment_id = kwargs.get("assessment_id") or generate_assessment_id()
-            job_id = kwargs.get("job_id") or generate_job_id()
-            ctx_tokens = set_assessment_context(assessment_id, job_id)
-            # Track MCP client session for interactive monitoring
-            _session = getattr(ctx, "session", None)
-            if _session is not None:
-                _session_id = id(_session)
-                session_registry.on_connect(_session_id)
-                session_registry.on_activity(_session_id)
-
-            async def progress(completed, total, message=None) -> None:
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"tool {t.name!r} is not agent_callable "
+                                f"(visibility={definition.visibility!r})"
+                            ),
+                            "forbidden": True,
+                            "visibility": definition.visibility,
+                            "code": 403,
+                        },
+                        indent=2,
+                    )
+                # ── Scope enforcement (Phase 1 Foundation) ──────────────────
+                # Every tool call passes through the server-side scope check
+                # before it is dispatched to the tool implementation.
+                tool_name = t.name
+                target = extract_target(kwargs)
                 try:
-                    await ctx.report_progress(completed, total, message=message)
-                except Exception:  # noqa: BLE001, S110
-                    pass  # client didn't ask for progress — no-op
+                    check_scope(target, tool_name)
+                except ValueError as exc:
+                    health.record_error()
+                    emit_log(
+                        ctx,
+                        "warning",
+                        f"Scope violation {tool_name} ({request_id}): {exc}",
+                    )
+                    return json.dumps({"error": str(exc), "scope_violation": True}, indent=2)
+                # ── Assessment / job context ────────────────────────────────
+                # Opaque handles stored on scans / evidence rows for traceability.
+                assessment_id = kwargs.get("assessment_id") or generate_assessment_id()
+                job_id = kwargs.get("job_id") or generate_job_id()
+                ctx_tokens = set_assessment_context(assessment_id, job_id)
+                # Track MCP client session for interactive monitoring
+                _session = getattr(ctx, "session", None)
+                if _session is not None:
+                    _session_id = id(_session)
+                    session_registry.on_connect(_session_id)
+                    session_registry.on_activity(_session_id)
 
-            token = set_progress_cb(progress)
-            try:
-                emit_log(ctx, "info", f"Starting {t.name} ({request_id})")
-                # Coerce string values to correct types based on schema
-                for pname, prop in properties.items():
-                    if pname in kwargs and kwargs[pname] is not None:
-                        expected = prop.get("type")
-                        val = kwargs[pname]
-                        if expected == "integer" and isinstance(val, str):
-                            kwargs[pname] = int(val)
-                        elif expected == "number" and isinstance(val, str):
-                            kwargs[pname] = float(val)
-                        elif expected == "boolean" and isinstance(val, str):
-                            kwargs[pname] = val.lower() in ("1", "true", "yes")
-                        elif expected == "boolean" and isinstance(val, bool):
-                            pass  # already correct
-                        elif isinstance(expected, list) and isinstance(val, str):
-                            # Union type allowing object/array — coerce JSON
-                            # strings; non-JSON plain text stays a string
-                            if any(t in ("object", "array") for t in expected):
-                                try:
-                                    kwargs[pname] = json.loads(val)
-                                except json.JSONDecodeError:
-                                    pass
-                        elif (
-                            expected == "object"
-                            and isinstance(val, str)
-                            or expected == "array"
-                            and isinstance(val, str)
-                        ):
-                            kwargs[pname] = json.loads(val)
-                logger.info(
-                    "request=%s tool=%s args=%s",
-                    request_id,
-                    t.name,
-                    list(kwargs.keys()),
-                )
-                result = await t.safe_execute(kwargs)
-                emit_log(ctx, "info", f"Completed {t.name} ({request_id})")
-                if t.name == "file_write":
-                    notify_resource_updated(ctx, "kali://artifacts")
-                if isinstance(result, dict) and "content" in result:
-                    for block in result["content"]:
-                        if isinstance(block, dict) and block.get("type") == "text":
-                            return block["text"]
-                return json.dumps(result, indent=2)
-            except asyncio.CancelledError:
-                logger.warning("request=%s tool=%s cancelled", request_id, t.name)
-                emit_log(ctx, "warning", f"Cancelled {t.name} ({request_id})")
-                return json.dumps({"error": "Request cancelled"})
-            except Exception:
-                health.record_error()
-                logger.exception("request=%s catastrophic error in tool %s", request_id, t.name)
-                emit_log(ctx, "error", f"Failed {t.name} ({request_id})")
-                return json.dumps({"error": "Tool execution failed"}, indent=2)
+                async def progress(completed, total, message=None) -> None:
+                    try:
+                        await ctx.report_progress(completed, total, message=message)
+                    except Exception:  # noqa: BLE001, S110
+                        pass  # client didn't ask for progress — no-op
+
+                token = set_progress_cb(progress)
+                try:
+                    emit_log(ctx, "info", f"Starting {t.name} ({request_id})")
+                    # Coerce string values to correct types based on schema
+                    for pname, prop in properties.items():
+                        if pname in kwargs and kwargs[pname] is not None:
+                            expected = prop.get("type")
+                            val = kwargs[pname]
+                            if expected == "integer" and isinstance(val, str):
+                                kwargs[pname] = int(val)
+                            elif expected == "number" and isinstance(val, str):
+                                kwargs[pname] = float(val)
+                            elif expected == "boolean" and isinstance(val, str):
+                                kwargs[pname] = val.lower() in ("1", "true", "yes")
+                            elif expected == "boolean" and isinstance(val, bool):
+                                pass  # already correct
+                            elif isinstance(expected, list) and isinstance(val, str):
+                                # Union type allowing object/array — coerce JSON
+                                # strings; non-JSON plain text stays a string
+                                if any(t in ("object", "array") for t in expected):
+                                    try:
+                                        kwargs[pname] = json.loads(val)
+                                    except json.JSONDecodeError:
+                                        pass
+                            elif (
+                                expected == "object"
+                                and isinstance(val, str)
+                                or expected == "array"
+                                and isinstance(val, str)
+                            ):
+                                kwargs[pname] = json.loads(val)
+                    logger.info(
+                        "request=%s tool=%s args=%s",
+                        request_id,
+                        t.name,
+                        list(kwargs.keys()),
+                    )
+                    result = await t.safe_execute(kwargs)
+                    emit_log(ctx, "info", f"Completed {t.name} ({request_id})")
+                    if t.name == "file_write":
+                        notify_resource_updated(ctx, "kali://artifacts")
+                    if isinstance(result, dict) and "content" in result:
+                        for block in result["content"]:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                return block["text"]
+                    return json.dumps(result, indent=2)
+                except asyncio.CancelledError:
+                    logger.warning("request=%s tool=%s cancelled", request_id, t.name)
+                    emit_log(ctx, "warning", f"Cancelled {t.name} ({request_id})")
+                    return json.dumps({"error": "Request cancelled"})
+                except Exception:
+                    health.record_error()
+                    logger.exception("request=%s catastrophic error in tool %s", request_id, t.name)
+                    emit_log(ctx, "error", f"Failed {t.name} ({request_id})")
+                    return json.dumps({"error": "Tool execution failed"}, indent=2)
+                finally:
+                    reset_assessment_context(ctx_tokens)
+                    reset_progress_cb(token)
             finally:
-                reset_assessment_context(ctx_tokens)
-                reset_progress_cb(token)
                 if profile_token is not None:
                     agent_context.reset_current_profile(profile_token)
 
@@ -498,15 +538,24 @@ def force_cleanup() -> str:
 
 # ── File Download Endpoint ─────────────────────────────────────
 async def download_file(request):
-    """Serve a file download by path."""
+    """Serve a file download, restricted to the configured artifact directory."""
+    from pathlib import Path
+
     from starlette.responses import FileResponse, JSONResponse
 
     path = request.query_params.get("path", "")
     if not path:
         return JSONResponse({"error": "Missing path parameter"}, status_code=400)
-    if not os.path.isfile(path):
+    try:
+        artifact_root = Path(config.artifact_dir).resolve()
+        resolved = Path(path).resolve()
+    except (OSError, ValueError):
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not resolved.is_relative_to(artifact_root):
+        return JSONResponse({"error": "Path is outside the artifact directory"}, status_code=403)
+    if not resolved.is_file():
         return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(path, media_type="application/octet-stream")
+    return FileResponse(str(resolved), media_type="application/octet-stream")
 
 
 # ── Monitor Endpoints ──────────────────────────────────────────────
@@ -602,6 +651,11 @@ class TokenAuthMiddleware:
         if scope["type"] == "http" and self.token:
             path = scope.get("path", "")
             method = scope.get("method", "")
+            # CORS preflight carries no credentials. Let CORSMiddleware answer
+            # OPTIONS itself (it is installed outermost) instead of 401-ing it.
+            if method == "OPTIONS":
+                await self.app(scope, receive, send)
+                return
             if not self._is_open(path, method):
                 from starlette.requests import Request
                 from starlette.responses import JSONResponse
@@ -619,33 +673,14 @@ class TokenAuthMiddleware:
         await self.app(scope, receive, send)
 
 
-# ── Main ────────────────────────────────────────────────────────
-def main() -> None:
-    """Run the MCP server over HTTP (SSE or streamable-http)."""
-    import uvicorn
+def _install_http_middleware(app, api_token: str) -> None:
+    """Install auth and CORS on the main app.
+
+    Starlette makes the *last* added middleware outermost. CORS is added after
+    auth so it can answer OPTIONS preflight before the token gate runs.
+    """
     from starlette.middleware.cors import CORSMiddleware
 
-    if config.transport == "streamable-http":
-        app = mcp.streamable_http_app()
-        logger.info("Transport: streamable-http")
-    else:
-        app = mcp.sse_app()
-        logger.info("Transport: sse")
-
-    origins = [o.strip() for o in config.allowed_origins.split(",") if o.strip()]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    api_token = os.getenv("MCP_API_TOKEN", "") or config.api_token
-    if not api_token and not config.insecure:
-        raise SystemExit(
-            "MCP_API_TOKEN is required. Set MCP_API_TOKEN in .env, or set "
-            "KALI_MCP_INSECURE=1 to run without authentication (dev only)."
-        )
     if api_token and not config.insecure:
         app.add_middleware(
             TokenAuthMiddleware,
@@ -659,6 +694,58 @@ def main() -> None:
         )
     else:
         logger.warning("KALI_MCP_INSECURE=1 or no MCP_API_TOKEN set — server is open.")
+
+    origins = [o.strip() for o in config.allowed_origins.split(",") if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+
+def _build_studio_app(api_token: str):
+    """Build the optional dedicated-port Studio app with the SAME auth gate."""
+    from starlette.applications import Starlette
+    from starlette.routing import Mount
+    from starlette.staticfiles import StaticFiles
+
+    from kmcp.studio.api import mount_studio_routes
+
+    studio_app = Starlette(routes=[])
+    if api_token and not config.insecure:
+        studio_app.add_middleware(
+            TokenAuthMiddleware,
+            token=api_token,
+            token_in_query=config.token_in_query,
+            open_paths=("/studio",),
+        )
+    mount_studio_routes(studio_app)
+    web_dir = os.path.join(os.path.dirname(__file__), "studio", "web")
+    if os.path.isdir(web_dir):
+        studio_app.routes.insert(0, Mount("/studio", StaticFiles(directory=web_dir, html=True)))
+    return studio_app
+
+
+# ── Main ────────────────────────────────────────────────────────
+def main() -> None:
+    """Run the MCP server over HTTP (SSE or streamable-http)."""
+    import uvicorn
+
+    if config.transport == "streamable-http":
+        app = mcp.streamable_http_app()
+        logger.info("Transport: streamable-http")
+    else:
+        app = mcp.sse_app()
+        logger.info("Transport: sse")
+
+    api_token = os.getenv("MCP_API_TOKEN", "") or config.api_token
+    if not api_token and not config.insecure:
+        raise SystemExit(
+            "MCP_API_TOKEN is required. Set MCP_API_TOKEN in .env, or set "
+            "KALI_MCP_INSECURE=1 to run without authentication (dev only)."
+        )
+    _install_http_middleware(app, api_token)
 
     # Graceful shutdown
     def _shutdown_handler(signum, frame):
@@ -697,15 +784,7 @@ def main() -> None:
     # app, so agents and the browser UI use separate ports.
     studio_ui_port = getattr(config, "studio_port", 0)
     if getattr(config, "studio_enabled", True) and studio_ui_port and studio_ui_port != config.port:
-        from starlette.applications import Starlette
-        from starlette.routing import Mount
-        from starlette.staticfiles import StaticFiles
-
-        studio_app = Starlette(routes=[])
-        if getattr(config, "studio_enabled", True):
-            mount_studio_routes(studio_app)
-        if os.path.isdir(web_dir):
-            studio_app.routes.insert(0, Mount("/studio", StaticFiles(directory=web_dir, html=True)))
+        studio_app = _build_studio_app(api_token)
 
         def _run_studio_ui() -> None:
             uvicorn.run(

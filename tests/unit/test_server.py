@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from kmcp import server
 from kmcp.server import (
     HealthMonitor,
     TokenAuthMiddleware,
@@ -221,13 +223,15 @@ class TestDownloadFile:
         body = json.loads(result.body)
         assert "error" in body
 
-    def test_nonexistent_file_returns_404(self, tmp_path) -> None:
+    def test_nonexistent_file_returns_404(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(server, "config", SimpleNamespace(artifact_dir=str(tmp_path)))
         fake_request = MagicMock()
         fake_request.query_params.get.return_value = str(tmp_path / "does_not_exist.bin")
         result = asyncio.run(download_file(fake_request))
         assert result.status_code == 404
 
-    def test_serves_existing_file(self, tmp_path) -> None:
+    def test_serves_existing_file(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(server, "config", SimpleNamespace(artifact_dir=str(tmp_path)))
         target = tmp_path / "artifact.bin"
         target.write_bytes(b"\x00\x01\x02\x03")
         fake_request = MagicMock()
@@ -235,6 +239,28 @@ class TestDownloadFile:
         result = asyncio.run(download_file(fake_request))
         assert result.status_code == 200
         assert result.media_type == "application/octet-stream"
+
+    def test_rejects_path_outside_artifact_dir(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setattr(
+            server, "config", SimpleNamespace(artifact_dir=str(tmp_path / "artifacts"))
+        )
+        secret = tmp_path / "secret.txt"
+        secret.write_text("top secret")
+        fake_request = MagicMock()
+        fake_request.query_params.get.return_value = str(secret)
+        result = asyncio.run(download_file(fake_request))
+        assert result.status_code == 403
+
+    def test_rejects_traversal_outside_artifact_dir(self, tmp_path, monkeypatch) -> None:
+        root = tmp_path / "artifacts"
+        root.mkdir()
+        monkeypatch.setattr(server, "config", SimpleNamespace(artifact_dir=str(root)))
+        outside = tmp_path / "outside.txt"
+        outside.write_text("top secret")
+        fake_request = MagicMock()
+        fake_request.query_params.get.return_value = str(root / ".." / "outside.txt")
+        result = asyncio.run(download_file(fake_request))
+        assert result.status_code == 403
 
 
 class TestMCPHealthAndCleanupTools:
