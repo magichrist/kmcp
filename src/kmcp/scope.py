@@ -17,6 +17,7 @@ When no scope is configured, all targets and operations are allowed
 
 from __future__ import annotations
 
+import ipaddress
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -83,9 +84,21 @@ def load_scope() -> Scope:
     )
 
 
+UNKNOWN_TARGET = "unknown"
+
+
 def _matches_pattern(target: str, pattern: str) -> bool:
-    """Check if a target matches a glob/CIDR-ish pattern."""
-    # Simple glob matching for now (supports *, ?)
+    """Check if a target matches a glob pattern or an IP/CIDR network."""
+    if "/" in pattern:
+        try:
+            network = ipaddress.ip_network(pattern, strict=False)
+        except ValueError:
+            network = None
+        if network is not None:
+            try:
+                return ipaddress.ip_address(target.strip()) in network
+            except ValueError:
+                return False
     return fnmatch(target, pattern)
 
 
@@ -117,6 +130,12 @@ def check_scope(
     # Check expiration
     if scope.is_expired():
         raise ValueError("scope has expired")
+
+    # Fail closed when a target scope is configured but the caller could not
+    # identify a target. Otherwise an unrecognised argument name would bypass
+    # every excluded/allowed pattern check below.
+    if target == UNKNOWN_TARGET and (scope.allowed_targets or scope.excluded_targets):
+        raise ValueError("target could not be identified; refusing call under configured scope")
 
     # Check excluded targets first
     if target:
@@ -170,6 +189,7 @@ def is_operation_allowed(tool_name: str | None, scope: Scope | None = None) -> b
 
 
 __all__ = [
+    "UNKNOWN_TARGET",
     "Scope",
     "check_scope",
     "is_operation_allowed",

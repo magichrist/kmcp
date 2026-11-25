@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,12 +32,49 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def extract_target(arguments: dict[str, Any]) -> str:
-    """Best-effort extraction of a target identifier from tool arguments."""
-    for key in ("target", "domain", "host", "repo", "query"):
-        val = arguments.get(key)
+# Canonical target argument names used across native tools, templates and
+# playbooks. The server-side scope gate relies on this list — an unrecognised
+# name must not silently become an unscoped "unknown" target.
+_TARGET_KEYS = ("target", "domain", "host", "hostname", "ip", "url", "repo", "query")
+_NESTED_PARAM_KEYS = ("params", "args", "inputs", "arguments", "options", "opts")
+
+
+def _first_target(mapping: Mapping[str, Any]) -> str | None:
+    """Return the first non-empty canonical target value in ``mapping``."""
+    for key in _TARGET_KEYS:
+        val = mapping.get(key)
         if isinstance(val, str) and val.strip():
             return val.strip()
+    return None
+
+
+def extract_target(arguments: dict[str, Any]) -> str:
+    """Best-effort extraction of a target identifier from tool arguments.
+
+    Checks canonical top-level keys, common nested parameter containers, and
+    ``targets`` lists so that scope enforcement sees the real target instead
+    of the ``"unknown"`` sentinel.
+    """
+    if not isinstance(arguments, Mapping):
+        return "unknown"
+
+    found = _first_target(arguments)
+    if found is not None:
+        return found
+
+    for container_key in _NESTED_PARAM_KEYS:
+        container = arguments.get(container_key)
+        if isinstance(container, Mapping):
+            found = _first_target(container)
+            if found is not None:
+                return found
+
+    targets = arguments.get("targets")
+    if isinstance(targets, (list, tuple)):
+        for val in targets:
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
     return "unknown"
 
 
