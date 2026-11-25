@@ -204,6 +204,17 @@ async def spawn_isolated(
         )
         duration = round(time.monotonic() - start, 3)
         return exit_code, "", stderr_text, duration
+    except asyncio.CancelledError:
+        # Cancellation is a BaseException (not caught by `except Exception`).
+        # Without this, an orphaned scanner keeps running after the caller
+        # has abandoned the request (BUG-023).
+        from kmcp.utils.process import kill_process_tree
+
+        try:
+            await kill_process_tree(proc)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
 
     duration = round(time.monotonic() - start, 3)
     stdout = stdout_bytes.decode("utf-8", errors="replace") if stdout_bytes else ""
