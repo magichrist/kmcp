@@ -21,6 +21,28 @@ _ALLOWED_DIRS_ENV = _os.getenv("MCP_ALLOWED_WRITE_DIRS", "")
 ALLOWED_WRITE_DIRS = [d.strip() for d in _ALLOWED_DIRS_ENV.split(",") if d.strip()]
 
 
+def _append_separator(arguments: dict[str, Any]) -> str:
+    """Resolve the optional separator; default '' preserves legacy behavior.
+
+    Both a real newline and the two-character escape ``\\n`` are accepted so
+    JSON/agent callers can request a leading newline either way.
+    """
+    separator = arguments.get("separator")
+    if separator is None:
+        newline = arguments.get("newline", False)
+        if isinstance(newline, str):
+            newline = newline.strip().lower() in ("true", "1", "yes")
+        separator = "\n" if newline else ""
+    if not isinstance(separator, str):
+        # ValueError keeps this a validation error (not "Execution failed").
+        raise ValueError("separator must be a string")
+    if separator == "\\n":
+        return "\n"
+    if separator == "\\r\\n":
+        return "\r\n"
+    return separator
+
+
 class FileWriteTool(BaseTool):
     @property
     def name(self) -> str:
@@ -60,6 +82,25 @@ class FileWriteTool(BaseTool):
                     "enum": ["overwrite", "append"],
                     "default": "overwrite",
                 },
+                "separator": {
+                    "type": "string",
+                    "description": (
+                        "Text inserted immediately before content in 'append' mode. "
+                        "Default '' means no separator (legacy behavior: content is "
+                        "appended raw). Use '\\n' (or the escaped form '\\\\n') for a "
+                        "leading newline. Ignored in 'overwrite' mode."
+                    ),
+                    "default": "",
+                },
+                "newline": {
+                    "type": "boolean",
+                    "description": (
+                        "Shorthand in 'append' mode: when true, prepend a newline "
+                        "(equivalent to separator='\\n'). Ignored when 'separator' "
+                        "is provided. Default false."
+                    ),
+                    "default": False,
+                },
             },
             "required": ["path", "content"],
         }
@@ -73,6 +114,7 @@ class FileWriteTool(BaseTool):
         content = arguments["content"]
         if not isinstance(content, str):
             raise TypeError("Content must be a string")
+        _append_separator(arguments)  # validate type early
         # Path containment check (skip if no dirs configured = unrestricted)
         if ALLOWED_WRITE_DIRS:
             resolved = os.path.realpath(path)
@@ -97,12 +139,15 @@ class FileWriteTool(BaseTool):
         path = arguments["path"]
         content = arguments["content"]
         mode = arguments.get("mode", "overwrite")
+        separator = _append_separator(arguments) if mode == "append" else ""
 
         try:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
             file_mode = "w" if mode == "overwrite" else "a"
             with open(path, file_mode) as f:  # noqa: ASYNC230
+                if separator:
+                    f.write(separator)
                 f.write(content)
 
             file_size = os.path.getsize(path)
@@ -114,7 +159,7 @@ class FileWriteTool(BaseTool):
                     {
                         "path": path,
                         "mode": mode,
-                        "bytes_written": len(content.encode("utf-8")),
+                        "bytes_written": len((separator + content).encode("utf-8")),
                         "file_size": file_size,
                     }
                 ),

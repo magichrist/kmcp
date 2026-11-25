@@ -43,7 +43,10 @@ class FileDownloadTool(BaseTool):
     def description(self) -> str:
         return (
             "Generate a download link for a file on the Kali server. "
-            "Returns a curl command the agent can run to save the file locally."
+            "Returns a curl command the agent can run to save the file locally. "
+            "The /download endpoint requires the MCP API token (supplied via "
+            "KMCP_API_TOKEN in the agent's environment) and only serves files "
+            "under the configured artifact directory."
         )
 
     @property
@@ -99,12 +102,32 @@ class FileDownloadTool(BaseTool):
 
         curl_cmd = f"curl -sS -o {shlex.quote(local_path)} {shlex.quote(download_url)}"
 
+        # Never embed the configured token in the printed command: tool stdout
+        # is captured into vault/evidence and a literal Bearer token leaks it.
+        # The command stays usable via an environment variable supplied
+        # out-of-band by the operator.
         if config.api_token:
-            curl_cmd += f' -H "Authorization: Bearer {config.api_token}"'
+            curl_cmd += ' -H "Authorization: Bearer $KMCP_API_TOKEN"'
 
+        artifact_dir = getattr(config, "artifact_dir", None)
+        scope_note = (
+            f"The /download endpoint requires authentication and only serves files under "
+            f"{artifact_dir}."
+            if artifact_dir
+            else (
+                "The /download endpoint requires authentication and only serves files under "
+                "the server's configured artifact directory."
+            )
+        )
+        auth_note = (
+            "Authentication: export KMCP_API_TOKEN in your environment from the MCP API "
+            "token (see your local environment/.env); the token is intentionally not "
+            "printed here — do not paste it into chat or tool arguments."
+        )
         stdout = (
             f"Download ready: {server_path} ({file_size:,} bytes)\n\n"
-            f"Run this command to save to {local_path}:\n{curl_cmd}"
+            f"Run this command to save to {local_path}:\n{curl_cmd}\n\n"
+            f"{auth_note}\n{scope_note}"
         )
 
         result = ExecutionResult(

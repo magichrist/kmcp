@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
 import shlex
+from pathlib import Path
 from typing import Any
 
 from kmcp.execution import engine
@@ -14,6 +17,45 @@ from kmcp.validation import (
     validate_enum,
     validate_required,
     validate_timeout,
+)
+
+# Amass initialises libpostal name-generation data on first use and needs root
+# for that download.  Never invoke sudo from the wrapper: that can block the
+# MCP server on an interactive password prompt.
+_LIBPOSTAL_DATA_DIRS = (
+    Path("/usr/share/amass/data"),
+    Path("/usr/share/amass/wordlists"),
+    Path.home() / ".config" / "amass" / "data",
+)
+
+
+def _libpostal_data_available() -> bool:
+    """Best-effort check that amass already has its data files seeded."""
+    for directory in _LIBPOSTAL_DATA_DIRS:
+        try:
+            if directory.is_dir() and any(directory.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _root_required_error() -> dict[str, Any]:
+    details = {
+        "missing_privilege": "root",
+        "reason": "amass needs root once to download/initialise libpostal name data",
+        "install_hint": (
+            "Run `sudo apt update && sudo apt install -y libpostal-data` and seed the "
+            "data once with `sudo amass enum -d example.com`, then retry as the "
+            "server user. This wrapper deliberately does not invoke sudo to avoid "
+            "hanging on a password prompt."
+        ),
+    }
+    return error_response(
+        ToolError(
+            error="Root required for amass data",
+            details=json.dumps(details, indent=2),
+        )
 )
 
 
@@ -74,6 +116,15 @@ class AmassTool(BaseTool):
             self.validate(arguments)
         except ValueError as e:
             return error_response(ToolError(error="Validation error", details=str(e)))
+        # Avoid the root-only libpostal download path entirely for unprivileged
+        # enum runs (intel mode needs no name data); emit a clear error instead
+        # of waiting on a sudo prompt.
+        if (
+            arguments.get("mode", "enum") == "enum"
+            and getattr(os, "geteuid", lambda: 0)() != 0
+            and not _libpostal_data_available()
+        ):
+            return _root_required_error()
         return success_response(
             await engine.execute(
                 command=self.build_command(arguments),

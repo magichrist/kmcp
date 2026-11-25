@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 from typing import Any
 
+from kmcp.models import ToolError
+from kmcp.responses import error_response
 from kmcp.tools.base import BaseTool
 from kmcp.tools.normalization import NormalizedToolMixin
 from kmcp.tools.persist import parse_hashcat, run_tool_with_persistence
 from kmcp.validation import validate_required
+
+
+def _missing_binary_error(binary: str, install_hint: str) -> dict[str, Any]:
+    """Return a structured, non-crashing error for an absent hashcat binary."""
+    details = {
+        "missing_binary": binary,
+        "install_hint": install_hint,
+        "message": f"Binary '{binary}' was not found in PATH. {install_hint}",
+    }
+    return error_response(
+        ToolError(error="Missing dependency", details=json.dumps(details, indent=2))
+    )
 
 
 def _parse(stdout: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -100,4 +116,14 @@ class HashcatTool(BaseTool, NormalizedToolMixin):
         }
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            self.validate(arguments)
+        except ValueError as e:
+            return error_response(ToolError(error="Validation error", details=str(e)))
+
+        cmd = self.build_command(arguments)
+        if shutil.which(cmd[0]) is None:
+            return _missing_binary_error(
+                cmd[0], "Install it with: apt update && apt install -y hashcat"
+            )
         return await run_tool_with_persistence(self, arguments, parser=_parse)

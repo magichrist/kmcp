@@ -2,12 +2,28 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 from typing import Any
 
+from kmcp.models import ToolError
+from kmcp.responses import error_response
 from kmcp.tools.base import BaseTool
 from kmcp.tools.normalization import NormalizedToolMixin
 from kmcp.tools.persist import run_tool_with_persistence
 from kmcp.validation import validate_required, validate_url
+
+
+def _missing_binary_error(binary: str, install_hint: str) -> dict[str, Any]:
+    """Return a structured, non-crashing error for an absent ZAP binary."""
+    details = {
+        "missing_binary": binary,
+        "install_hint": install_hint,
+        "message": f"Binary '{binary}' was not found in PATH. {install_hint}",
+    }
+    return error_response(
+        ToolError(error="Missing dependency", details=json.dumps(details, indent=2))
+    )
 
 
 def _parse(stdout: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -51,6 +67,12 @@ class ZapTool(BaseTool, NormalizedToolMixin):
     def default_timeout(self) -> int:
         return 900
 
+    @property
+    def binary(self) -> str:
+        # The wrapper name is "zap", but the actual executable is the
+        # baseline script shipped by the zaproxy package.
+        return "zap-baseline.py"
+
     def input_schema(self) -> dict[str, Any]:
         return {
             "type": "object",
@@ -76,4 +98,14 @@ class ZapTool(BaseTool, NormalizedToolMixin):
         return {"normalized": {"scan_output": (stdout or "").strip()[:2000]}}
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            self.validate(arguments)
+        except ValueError as e:
+            return error_response(ToolError(error="Validation error", details=str(e)))
+
+        cmd = self.build_command(arguments)
+        if shutil.which(cmd[0]) is None:
+            return _missing_binary_error(
+                cmd[0], "Install it with: apt update && apt install -y zaproxy"
+            )
         return await run_tool_with_persistence(self, arguments, parser=_parse)

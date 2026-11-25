@@ -2,12 +2,45 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from kmcp.tools.base import BaseTool
 from kmcp.tools.normalization import NormalizedToolMixin
 from kmcp.tools.persist import run_tool_with_persistence
 from kmcp.validation import validate_required
+
+
+def _surface_execution_details(result: dict[str, Any]) -> dict[str, Any]:
+    """Expose bettercap's stderr/exit_code so failures are not silent."""
+    try:
+        block = result["content"][0]
+        payload = json.loads(block["text"])
+        if not isinstance(payload, dict):
+            return result
+        raw = payload.get("raw") or {}
+        stderr = str(raw.get("stderr") or "")
+        exit_code = raw.get("exit_code", 0)
+
+        normalized = payload.setdefault("normalized", {})
+        normalized["stderr"] = stderr
+        normalized["exit_code"] = exit_code
+
+        failed = exit_code not in (0, None) or any(
+            marker in stderr.lower() for marker in ("error", "failed", "fatal")
+        )
+        if failed:
+            payload["success"] = False
+            normalized["failure_reason"] = (
+                f"bettercap exited with code {exit_code}: "
+                f"{stderr.strip()[:500] or 'no stderr produced'}"
+            )
+            if "Binary not found" in stderr:
+                normalized["install_hint"] = "Install it with: apt install bettercap"
+        block["text"] = json.dumps(payload, indent=2)
+    except (KeyError, IndexError, TypeError, ValueError):
+        return result
+    return result
 
 
 def _parse(stdout: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -96,4 +129,5 @@ class BettercapTool(BaseTool, NormalizedToolMixin):
         return {"normalized": {"session_output": (stdout or "").strip()[:2000]}}
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return await run_tool_with_persistence(self, arguments, parser=_parse)
+        result = await run_tool_with_persistence(self, arguments, parser=_parse)
+        return _surface_execution_details(result)

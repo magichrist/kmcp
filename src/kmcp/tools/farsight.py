@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from pathlib import Path
@@ -15,6 +16,20 @@ from kmcp.validation import validate_domain
 
 logger = logging.getLogger("kmcp.tools")
 from kmcp.config import config
+
+
+def _traceback_error(result: Any) -> dict[str, Any]:
+    """Turn a farsight Python traceback into a structured MCP error."""
+    stderr = str(getattr(result, "stderr", "") or "")
+    last_line = next((line.strip() for line in reversed(stderr.splitlines()) if line.strip()), "")
+    details = {
+        "reason": last_line[:300],
+        "exit_code": getattr(result, "exit_code", None),
+        "stderr": stderr[-2000:],
+    }
+    return error_response(
+        ToolError(error="Farsight failed", details=json.dumps(details, indent=2))
+    )
 
 
 class FarsightTool(BaseTool):
@@ -97,31 +112,48 @@ class FarsightTool(BaseTool):
             logger.exception("Tool %s failed", self.name)
             return error_response(ToolError(error="Execution failed", details=str(e)))
 
-        timeout = arguments.get("timeout", self.default_timeout)
-        cmd, report_path = self._build_full(arguments)
+        try:
+            timeout = arguments.get("timeout", self.default_timeout)
+            cmd, report_path = self._build_full(arguments)
 
-        result = await engine.execute(cmd, tool=self.name, timeout=timeout)
+            result = await engine.execute(cmd, tool=self.name, timeout=timeout)
 
-        # Read the report file back with integrity check
-        if report_path.exists():
-            try:
-                file_size = report_path.stat().st_size
-                if file_size == 0:
-                    result.stderr = "Report file is empty"
-                    result.success = False
-                else:
-                    report_content = report_path.read_text(encoding="utf-8")
-                    if not report_content.strip():
-                        result.stderr = "Report file contains no content"
+            # A raw Python traceback on stderr is never a useful tool result.
+            if "Traceback (most recent call last)" in (result.stderr or ""):
+                return _traceback_error(result)
+
+            # Read the report file back with integrity check
+            if report_path.exists():
+                try:
+                    file_size = report_path.stat().st_size
+                    if file_size == 0:
+                        result.stderr = "Report file is empty"
                         result.success = False
                     else:
-                        result.stdout = f"=== Report: {report_path.name} ({file_size} bytes) ===\n\n{report_content}"
-            except (OSError, UnicodeDecodeError) as e:
-                result.stderr = f"Failed to read report: {e}"
-                result.success = False
-        else:
-            if result.success:
-                result.stderr = "Report file not created by farsight"
-                result.success = False
+                        report_content = report_path.read_text(encoding="utf-8")
+                        if not report_content.strip():
+                            result.stderr = "Report file contains no content"
+                            result.success = False
+                        else:
+                            result.stdout = (
+                                f"=== Report: {report_path.name} ({file_size} bytes) ===\n\n"
+                                f"{report_content}"
+                            )
+                except (OSError, UnicodeDecodeError) as e:
+                    result.stderr = f"Failed to read report: {e}"
+                    result.success = False
+            else:
+                if result.success:
+                    result.stderr = "Report file not created by farsight"
+                    result.success = False
 
-        return success_response(result)
+            return success_response(result)
+        except Exception as e:  # never leak a traceback to agents
+            logger.exception("Tool %s failed", self.name)
+            details = {
+                "reason": f"{type(e).__name__}: {e}",
+                "error": "unexpected failure while running farsight",
+            }
+            return error_response(
+                ToolError(error="Execution failed", details=json.dumps(details, indent=2))
+            )
