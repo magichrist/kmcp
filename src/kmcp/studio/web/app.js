@@ -2702,11 +2702,12 @@ async function publish() {
     await refreshPlaybooks();
   } catch (err) {
     if (/approval/i.test(err.message || "")) {
-      if (confirm(`Publishing requires an approval request first.\nCreate the pending approval for ${selectedId} and retry?`)) {
+      /* An approval request is only a request — an operator must approve it
+         through /api/approvals/{id}/approve before publish is allowed. */
+      if (confirm(`Publishing requires operator approval for ${selectedId}.\nSend an approval request?`)) {
         try {
           await api(`/playbooks/${encodeURIComponent(selectedId)}/approval-request`, { method: "POST" });
-          toast("Approval request recorded — retrying publish");
-          await publish();
+          toast("Approval request sent — an operator must approve it before publishing");
         } catch (e2) { toast(e2.message, true); }
       }
       return;
@@ -2906,11 +2907,11 @@ async function publishPlaybookById(pid) {
     await refreshPlaybooks();
   } catch (err) {
     if (/approval/i.test(err.message || "")) {
-      if (confirm("Create approval request?")) {
+      /* Never self-approve: request only, then wait for an operator decision. */
+      if (confirm("Publishing requires operator approval. Send an approval request?")) {
         try {
           await api(`/playbooks/${encodeURIComponent(pid)}/approval-request`, { method: "POST" });
-          toast("Approval request recorded — retrying publish");
-          await publishPlaybookById(pid);
+          toast("Approval request sent — an operator must approve it before publishing");
         } catch (e2) { toast(e2.message, true); }
       }
       return;
@@ -4073,28 +4074,10 @@ function updateFindingsCountBadge(total) {
   headRight.appendChild(badge);
 }
 
-/* Client-side sort of the cached findings by the current sort state.
-   Column indexes: 0 Title, 1 Severity, 2 Tool, 3 Target, 4 Status, 5 Created. */
-function sortFindings(rows, state) {
-  if (!state || !state.col) return rows.slice();
-  const keyFor = (f) => {
-    switch (state.col) {
-      case 0: return f.title || f.test_name || f.checkname || f.name || "";
-      case 1: return f.severity || "";
-      case 2: return f.tool || "";
-      case 3: return f.target || "";
-      case 4: return f.status || f.validation_status || "";
-      case 5: return f.created_at || "";
-      default: return "";
-    }
-  };
-  return rows.slice().sort((a, b) => {
-    const av = String(keyFor(a)); const bv = String(keyFor(b));
-    let c = 0;
-    if (av < bv) c = -1; else if (av > bv) c = 1;
-    return state.dir === "asc" ? c : -c;
-  });
-}
+/* Column indexes: 0 Title, 1 Severity, 2 Tool, 3 Target, 4 Status, 5 Created.
+   Sorting and pagination are performed by the API (see findings_api); the
+   frontend renders the returned page verbatim — no second slice. */
+const FND_SORT_FIELDS = ["title", "severity", "tool", "target", "status", "created_at"];
 
 async function refreshFindings() {
   const el = $("#findingTable");
@@ -4109,14 +4092,18 @@ async function refreshFindings() {
   if (tool) params.set("tool", tool);
   params.set("limit", fndPage.limit);
   params.set("offset", fndPage.offset);
+  const sortField = FND_SORT_FIELDS[fndSort.col];
+  if (sortField) {
+    params.set("sort", sortField);
+    params.set("dir", fndSort.dir);
+  }
   el.innerHTML = `<div class="panel table-panel"><p class="empty">Loading findings…</p></div>`;
   if (pg) pg.innerHTML = "";
   try {
     const d = await api(`/findings?${params}`);
     findingsCache = d.findings || [];
     const total = d.count ?? 0;
-    const sorted = sortFindings(findingsCache, fndSort);
-    const pageRows = sorted.slice(fndPage.offset, fndPage.offset + fndPage.limit);
+    const pageRows = findingsCache; // backend already applied sort + pagination
     const from = total ? fndPage.offset + 1 : 0;
     const to = Math.min(fndPage.offset + fndPage.limit, total);
     const hasPrev = fndPage.offset > 0;
@@ -4163,6 +4150,7 @@ async function refreshFindings() {
     wireSortHeaders(el, (col) => {
       if (fndSort.col === col) fndSort.dir = fndSort.dir === "asc" ? "desc" : "asc";
       else { fndSort.col = col; fndSort.dir = "asc"; }
+      fndPage.offset = 0; // a new sort starts from the first page
       refreshFindings();
     });
     if (pg) {
