@@ -418,7 +418,11 @@ def vault_delete(category: str, name: str) -> dict[str, Any]:
         finally:
             conn.close()
         try:
-            if mirror.is_file() and Path(VAULT_ROOT) in mirror.resolve().parents:
+            # VAULT_ROOT is relative by default, so compare resolved paths —
+            # otherwise the containment check is always False and the mirror
+            # would survive the delete (and resurrect the row on read).
+            root = Path(VAULT_ROOT).resolve()
+            if mirror.is_file() and mirror.resolve().is_relative_to(root):
                 mirror.unlink()
         except OSError:
             pass
@@ -556,10 +560,34 @@ vault_encrypt = encrypt_value
 vault_decrypt = decrypt_value
 
 
+def _secret_ref_passphrase() -> str:
+    """Passphrase protecting secret-ref values stored in the vault.
+
+    Stable across processes so a ref written by one run resolves in another;
+    operators can override it with MCP_VAULT_PASSPHRASE.
+    """
+    return _os.getenv("MCP_VAULT_PASSPHRASE", "kmcp-vault-secret")
+
+
 def write_secret_ref(name: str, value: str) -> str:
-    """Store a secret reference (returns a vault handle, not the value)."""
+    """Store a secret reference (returns a vault handle, not the value).
+
+    The value is encrypted at rest so the handle can actually be resolved.
+    Refs written before the value was stored simply lack ``value`` and keep
+    resolving to None (backwards compatible).
+    """
     ref = f"secret:{name}"
-    vault_write("secrets", name, {"ref": ref, "redacted": True}, tags="secret")
+    vault_write(
+        "secrets",
+        name,
+        {
+            "ref": ref,
+            "redacted": True,
+            "value": encrypt_value(value, _secret_ref_passphrase()),
+            "encrypted": True,
+        },
+        tags="secret",
+    )
     return ref
 
 
@@ -571,7 +599,13 @@ def resolve_secret_ref(ref: str) -> str | None:
     try:
         raw = vault_read("secrets", name)
         data = json.loads(raw) if isinstance(raw, str) else raw
-        return data.get("value")
+        value = data.get("value")
+        if value is None:
+            return None
+        if data.get("encrypted"):
+            return decrypt_value(value, _secret_ref_passphrase())
+        # Legacy refs stored the value verbatim; keep honouring them.
+        return value
     except Exception:  # noqa: BLE001
         return None
 
@@ -580,42 +614,34 @@ def resolve_secret_ref(ref: str) -> str | None:
 
 import re as _re
 
-_SECRET_PATTERNS = [
-    _re.compile(
-        r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*['\"]?([A-Za-z0-9_\-]{8,})['\"]?"
-    ),
-    _re.compile(
-        r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
-        _re.DOTALL,
-    ),
-    _re.compile(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{10,}"),
-]
+# Key names are anchored with word boundaries so ordinary prose (e.g. a
+# "password policy" note) is left alone. Values run up to whitespace or a
+# quote/EOL so realistic secrets (JWTs, AWS keys, "p@ss!") are replaced in
+# full instead of being partially clipped at the first punctuation mark.
+_SECRET_KV_RE = _re.compile(
+    r"(?i)((?:^|[^A-Za-z0-9])(?:aws[_-]?secret[_-]?access[_-]?key|secret[_-]?access[_-]?key|"
+    r"api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*)(['\"]?)([^\s'\"]+)\2"
+)
+_SECRET_PRIVATE_KEY_RE = _re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
+    _re.DOTALL,
+)
+_SECRET_BEARER_RE = _re.compile(r"(?i)bearer\s+[^\s'\"]{10,}")
+
+_SECRET_PATTERNS = [_SECRET_KV_RE, _SECRET_PRIVATE_KEY_RE, _SECRET_BEARER_RE]
 
 
 def redact_secrets(text: str) -> str:
     """Redact common secret patterns from text. Returns redacted string."""
     if not isinstance(text, str):
         text = str(text)
-    out = text
-    # key=value / key: value secrets
-    out = _re.sub(
-        r"(?i)(api[_-]?key|token|secret|password|passwd|pwd)\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{8,}['\"]?",
-        lambda m: (
-            m.group(0).split(m.group(1) if False else "", 1)[0] + "[REDACTED]"
-            if False
-            else _re.sub(r"([:=]\s*['\"]?)[A-Za-z0-9_\-]{8,}", r"\1[REDACTED]", m.group(0))
-        ),
-        out,
-    )
+    # key=value / key: value secrets — preserve the key and delimiters,
+    # replace the entire value with the redaction marker.
+    out = _SECRET_KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]{m.group(2)}", text)
     # private keys
-    out = _re.sub(
-        r"-----BEGIN (?:RSA |EC |OPENSSH |)PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH |)PRIVATE KEY-----",
-        "[REDACTED PRIVATE KEY]",
-        out,
-        flags=_re.DOTALL,
-    )
+    out = _SECRET_PRIVATE_KEY_RE.sub("[REDACTED PRIVATE KEY]", out)
     # bearer tokens
-    out = _re.sub(r"(?i)bearer\s+[A-Za-z0-9_\-\.]{10,}", "Bearer [REDACTED]", out)
+    out = _SECRET_BEARER_RE.sub("Bearer [REDACTED]", out)
     return out
 
 
