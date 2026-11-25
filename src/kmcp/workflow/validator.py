@@ -522,6 +522,9 @@ def _validate_steps(
 
     steps: list[StepDefinition] = []
     seen: set[str] = set()
+    step_ids = {
+        s.id for s in raw_steps if isinstance(s, StepDefinition) and isinstance(s.id, str) and s.id
+    }
     modules = _normalise_catalog(module_catalog) if module_catalog is not None else None
 
     for index, step in enumerate(raw_steps):
@@ -546,7 +549,7 @@ def _validate_steps(
 
         _validate_step_type(step, raw_index, findings)
         _validate_tool_reference(step, raw_index, modules, findings)
-        _validate_foreach(step, input_specs, findings)
+        _validate_foreach(step, input_specs, step_ids, findings)
         _validate_when(step, findings)
 
         if not isinstance(step.args, Mapping):
@@ -958,8 +961,25 @@ def _validate_references(
                     _check_reference(body, step.id, context, path, findings)
 
         if isinstance(step.foreach, str):
-            for path, body in _walk_string_refs(step.foreach, "foreach"):
-                _check_reference(body, step.id, context, path, findings)
+            bodies = list(_walk_string_refs(step.foreach, "foreach"))
+            if not bodies and _BARE_STEP_REF_RE.match(step.foreach.strip()):
+                bodies = [("foreach", step.foreach.strip())]
+            for path, body in bodies:
+                _check_reference(body, step.id, context, path, findings, allow_bare=True)
+
+        # ``when`` is a structured condition: validate its field reference with
+        # the consumer step's dependency context (BUG-035).
+        if isinstance(step.when, str):
+            match = _WHEN_RE.match(step.when.strip())
+            if match is not None:
+                expression = (match.group("braced") or match.group("bare") or "").strip()
+                bodies = list(_walk_string_refs(expression, "when"))
+                if not bodies and (
+                    _BARE_STEP_REF_RE.match(expression) or expression in ("target",)
+                ):
+                    bodies = [("when", expression)]
+                for path, body in bodies:
+                    _check_reference(body, step.id, context, path, findings, allow_bare=True)
 
         raw_step = raw_index.get(step.id, {})
         declared_outputs = raw_step.get("outputs")
@@ -1045,6 +1065,19 @@ def _check_reference(
     parsed = _parse_reference(expression)
     if parsed is None and allow_bare:
         parsed = _parse_bare_step_reference(expression, context.step_ids)
+        if parsed is None and _BARE_STEP_REF_RE.match(expression):
+            # A step-shaped bare ref with a typo should name the unknown step.
+            step_id = expression.split(".", 1)[0]
+            hint = _suggestion(step_id, context.step_ids)
+            findings.append(
+                _finding(
+                    "error",
+                    consumer,
+                    field,
+                    f"reference to unknown step {step_id!r}{hint}",
+                )
+            )
+            return
     if parsed is None:
         findings.append(
             _finding(
@@ -1221,15 +1254,16 @@ def _parse_bare_step_reference(body: str, step_ids: set[str]) -> tuple[str, ...]
 def _validate_foreach(
     step: StepDefinition,
     input_specs: dict[str, _InputSpec],
+    step_ids: set[str],
     findings: list[Finding],
 ) -> None:
     """Validate a ``foreach`` target against the structured reference grammar.
 
     Per the DSL spec, ``foreach`` must reference a collection: typically
     ``{{steps.STEP.FIELD}}`` produced by a dependency step (dependency and
-    field checks happen later in ``_validate_references``, alongside args and
-    output mappings), or ``{{inputs.NAME}}`` where NAME is a declared input
-    whose type resolves to ``array``.
+    field checks happen later in ``_validate_references``), a bare engine-style
+    ``STEP.FIELD`` reference, or ``{{inputs.NAME}}`` where NAME is a declared
+    input whose type resolves to ``array``.
     """
     foreach = step.foreach
     if foreach is None:
@@ -1251,13 +1285,17 @@ def _validate_foreach(
         return
     parsed = _parse_reference(body)
     if parsed is None:
+        # Documented bare engine refs such as ``res.hosts`` are legal; the
+        # dependency and field checks run in _validate_references (BUG-036).
+        parsed = _parse_bare_step_reference(body, step_ids)
+    if parsed is None:
         findings.append(
             _finding(
                 "error",
                 step.id,
                 "foreach",
                 f"foreach must reference a collection field, got {foreach!r} "
-                "(use {{steps.STEP.FIELD}} or {{inputs.NAME}})",
+                "(use {{steps.STEP.FIELD}}, STEP.FIELD or {{inputs.NAME}})",
             )
         )
         return
