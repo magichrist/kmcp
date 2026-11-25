@@ -53,6 +53,40 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
+_TARGET_INPUT_KEYS = ("target", "host", "ip", "domain", "url")
+
+
+def _declared_template_params(template_id: str) -> set[str] | None:
+    """Return declared template parameter names, or None when unavailable."""
+    try:
+        from kmcp.playbooks.registry import get_template
+
+        return set((get_template(template_id).get("parameters") or {}).keys())
+    except Exception:  # noqa: BLE001 — lookup is best-effort here
+        return None
+
+
+def _map_flat_target(
+    arguments: dict[str, Any], params: dict[str, Any], declared: set[str] | None
+) -> dict[str, Any]:
+    """Map the first supplied target-like key into ``params['target']``.
+
+    Flat target aliases are MCP-level fields and are otherwise dropped from
+    template parameters. Only templates that declare ``target`` get the mapped
+    value.
+    """
+    if params.get("target") is not None:
+        return params
+    if declared is not None and "target" not in declared:
+        return params
+    for key in _TARGET_INPUT_KEYS:
+        value = arguments.get(key)
+        if value not in (None, ""):
+            params["target"] = value
+            break
+    return params
+
+
 def _payload(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
@@ -301,6 +335,8 @@ class PlaybookRunTool(BaseTool):
                 detail=detail,
                 assessment_id=assessment_id,
                 job_id=job_id,
+                inputs=arguments.get("inputs"),
+                options=arguments.get("options"),
             )
             STATUS = JOB_REGISTRY[job_id]
             STATUS["status"] = (
@@ -380,7 +416,8 @@ class PlaybookRunTool(BaseTool):
         (password, secret, token, api_key, …) are redacted from output.
         """
         # Merge flat top-level params into params dict
-        params = arguments.get("params") or {}
+        params = dict(arguments.get("params") or {})
+        params = _map_flat_target(arguments, params, _declared_template_params(template_id))
         _mcp_keys = frozenset(
             {
                 "template_id",
