@@ -38,10 +38,31 @@ class CoverageTracker:
         self._assets_seen: dict[str, set[str]] = {}
         # assessment_id -> set of (asset_id, service) tuples scanned
         self._services_scanned: dict[str, set[tuple[str, str | None]]] = {}
+        # assessment_id -> set of assets discovered (independently of scans)
+        self._discovered_assets: dict[str, set[str]] = {}
+        # assessment_id -> set of (asset_id, service) tuples discovered
+        self._discovered_services: dict[str, set[tuple[str, str | None]]] = {}
         # assessment_id -> set of tool names used
         self._tools_used: dict[str, set[str]] = {}
         # assessment_id -> total findings count
         self._findings_count: dict[str, int] = {}
+
+    # ── discovery API ─────────────────────────────────────────────────
+
+    def register_asset(self, assessment_id: str, asset_id: str) -> None:
+        """Register an asset as discovered, without recording a scan for it.
+
+        Discovery is deliberately separate from :meth:`record_coverage`: an
+        asset found by an inventory/host-discovery step may never be scanned,
+        which is exactly the gap the summary and gap report must expose.
+        """
+        self._discovered_assets.setdefault(assessment_id, set()).add(asset_id)
+        self._assets_seen.setdefault(assessment_id, set()).add(asset_id)
+
+    def register_service(self, assessment_id: str, asset_id: str, service: str | None) -> None:
+        """Register a discovered service on an asset (not necessarily scanned)."""
+        self.register_asset(assessment_id, asset_id)
+        self._discovered_services.setdefault(assessment_id, set()).add((asset_id, service))
 
     # ── public API ────────────────────────────────────────────────────
 
@@ -73,7 +94,8 @@ class CoverageTracker:
         )
         self._records.setdefault(assessment_id, []).append(record)
 
-        self._assets_seen.setdefault(assessment_id, set()).add(asset_id)
+        # A scanned asset/service is by definition also discovered.
+        self.register_service(assessment_id, asset_id, service)
         self._services_scanned.setdefault(assessment_id, set()).add((asset_id, service))
         self._tools_used.setdefault(assessment_id, set()).add(tool)
         self._findings_count[assessment_id] = (
@@ -96,7 +118,9 @@ class CoverageTracker:
             ``description`` fields.
         """
         gaps: list[dict[str, Any]] = []
-        assets_seen = self._assets_seen.get(assessment_id, set())
+        assets_seen = self._assets_seen.get(assessment_id, set()) | self._discovered_assets.get(
+            assessment_id, set()
+        )
         services_scanned = self._services_scanned.get(assessment_id, set())
         records = self._records.get(assessment_id, [])
 
@@ -115,8 +139,11 @@ class CoverageTracker:
                     }
                 )
 
-        # Services discovered but never scanned
-        for asset_id, service in services_scanned:
+        # Services discovered but never scanned. Discovery is now an explicit
+        # set (populated by register_service / record_coverage); using the
+        # scanned set here made gaps structurally unreachable.
+        discovered_services = self._discovered_services.get(assessment_id, set()) | services_scanned
+        for asset_id, service in discovered_services:
             if service is None:
                 continue
             has_scan = any(r.asset_id == asset_id and r.service == service for r in records)
@@ -156,7 +183,9 @@ class CoverageTracker:
             services scanned, findings count, and gap count.
         """
         records = self._records.get(assessment_id, [])
-        assets_seen = self._assets_seen.get(assessment_id, set())
+        assets_seen = self._assets_seen.get(assessment_id, set()) | self._discovered_assets.get(
+            assessment_id, set()
+        )
         tools_used = self._tools_used.get(assessment_id, set())
         services_scanned = self._services_scanned.get(assessment_id, set())
 
