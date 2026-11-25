@@ -110,6 +110,65 @@ def _success_tool_result(
     )
 
 
+def _write_assessment_vault_row(
+    *,
+    assessment_id: str,
+    job_id: str | None,
+    status: str,
+    summary: dict[str, Any] | None,
+    findings: list[Any] | None,
+    next_actions: list[str] | None,
+    targets: list[str] | None,
+    tool: str,
+) -> None:
+    """Deposit a completed run in the vault ``assessments`` category.
+
+    ``report_generate``/``job_control`` resolve assessments by id from this
+    category, so every completed playbook run must leave the same normalized
+    payload that ``AssessmentRunTool._write_assessment_vault_summary`` writes.
+    Vault persistence is best-effort: it must never fail an otherwise
+    successful run.
+    """
+    try:
+        from kmcp.utils.vault import vault_write
+
+        normalized_findings: list[dict[str, Any]] = []
+        for finding in findings or []:
+            if not isinstance(finding, dict):
+                continue
+            item = dict(finding)
+            item.setdefault("id", finding.get("finding_id") or _new_id("finding"))
+            item.setdefault("title", "Untitled finding")
+            item.setdefault("severity", "informational")
+            item.setdefault("confidence", 0.5)
+            item.setdefault("validation_status", "observed")
+            item.setdefault("asset_id", finding.get("target") or "unknown")
+            item.setdefault("source_tools", list(finding.get("source_modules") or []))
+            item.setdefault("evidence_refs", [])
+            item.setdefault("description", "")
+            item.setdefault("remediation", "")
+            normalized_findings.append(item)
+
+        payload = {
+            "assessment_id": assessment_id,
+            "job_id": job_id,
+            "status": status,
+            "summary": summary or {},
+            "findings": normalized_findings,
+            "next_actions": list(next_actions or []),
+        }
+        vault_write(
+            category="assessments",
+            name=assessment_id,
+            content=payload,
+            target=",".join(t for t in (targets or []) if t),
+            tool=tool,
+            tags=f"assessment:{assessment_id}" + (f",job:{job_id}" if job_id else ""),
+        )
+    except Exception:  # vault write is best-effort
+        logger.debug("assessment vault write failed for %s", assessment_id, exc_info=True)
+
+
 # ── playbook_run ──────────────────────────────────────────────────────
 
 
@@ -399,6 +458,17 @@ class PlaybookRunTool(BaseTool):
                 if k in assessment
             }
 
+        _write_assessment_vault_row(
+            assessment_id=payload["assessment_id"],
+            job_id=job_id,
+            status=engine_status,
+            summary=summary,
+            findings=payload["findings"],
+            next_actions=payload["next_actions"],
+            targets=[target],
+            tool=self.name,
+        )
+
         result = _success_tool_result(self.name, payload)
         result["assessment_run"] = payload
         return result
@@ -499,6 +569,17 @@ class PlaybookRunTool(BaseTool):
             "next_actions": res_dict.get("next_actions", []) or [],
             "execution": res_dict.get("execution", {}) or {},
         }
+
+        _write_assessment_vault_row(
+            assessment_id=assessment_id,
+            job_id=job_id,
+            status=STATUS["status"],
+            summary=payload["summary"],
+            findings=payload["findings"],
+            next_actions=payload["next_actions"],
+            targets=[target],
+            tool=self.name,
+        )
 
         result = _success_tool_result(self.name, payload)
         result["assessment_run"] = payload
@@ -638,6 +719,18 @@ class PlaybookRunTool(BaseTool):
         }
         if arguments.get("detail") == "full":
             out["step_results"] = payload.get("step_results", {})
+
+        _write_assessment_vault_row(
+            assessment_id=assessment_id,
+            job_id=job_id,
+            status=out["status"],
+            summary=out["summary"],
+            findings=payload.get("findings") or [],
+            next_actions=out["next_actions"],
+            targets=[target],
+            tool=self.name,
+        )
+
         result = _success_tool_result(self.name, out)
         result["assessment_run"] = {
             "job_id": job_id,
@@ -870,6 +963,45 @@ def _error_payload_text(payload: dict[str, Any] | str) -> dict[str, Any]:
 # ── playbook_catalog ──────────────────────────────────────────────────
 
 
+def _studio_catalog_entry(
+    pb: dict[str, Any], detail: str, db: Any | None
+) -> dict[str, Any] | None:
+    """Build a public catalog entry from a Studio playbook row.
+
+    Non-published rows are invisible. The current published version's
+    definition supplies the description/inputs/outputs in ``compact`` mode
+    and the full definition in ``full`` mode — the same shape used by the
+    agent-profile (assigned playbooks) path.
+    """
+    if pb.get("status") != "published":
+        return None
+    entry: dict[str, Any] = {
+        "id": pb.get("playbook_id"),
+        "name": pb.get("name") or pb["playbook_id"],
+        "source": "studio",
+    }
+    vid = pb.get("current_version_id")
+    if db is not None and vid is not None:
+        try:
+            version = db.get_playbook_version(vid)
+            definition = version.get("definition") if version else None
+            if isinstance(definition, str):
+                definition = json.loads(definition)
+            if isinstance(definition, dict):
+                entry["description"] = definition.get("description", "")
+                if detail == "compact":
+                    entry["inputs"] = sorted((definition.get("inputs") or {}).keys())
+                    entry["outputs"] = sorted((definition.get("outputs") or {}).keys())
+                else:
+                    entry["definition"] = definition
+                entry["estimated_duration"] = (definition.get("execution") or {}).get(
+                    "timeout", 300
+                )
+        except Exception:  # noqa: BLE001 — unparsable definition never blocks the catalog
+            logger.debug("playbook_catalog: could not parse definition for %s", entry.get("id"))
+    return entry
+
+
 class PlaybookCatalogTool(BaseTool):
     """List available playbooks (black-box contract — no internals exposed)."""
 
@@ -914,45 +1046,19 @@ class PlaybookCatalogTool(BaseTool):
 
         detail = arguments.get("detail", "compact")
 
-        # ── Studio path: agent profile context → assigned playbooks only
         profile = get_current_profile()
-        if profile:
-            from kmcp.db import manager as dbm
+        from kmcp.db import manager as dbm
 
-            db = dbm.get_db()
+        db = dbm.get_db()
+
+        # ── Studio path: agent profile context → assigned playbooks only
+        if profile:
             assigned = agent_context.assigned_playbooks(profile) if db else []
             playbooks = []
             for pb in assigned:
-                if pb.get("status") != "published":
-                    continue
-                entry: dict[str, Any] = {
-                    "id": pb["playbook_id"],
-                    "name": pb.get("name", pb["playbook_id"]),
-                    "source": "studio",
-                }
-                vid = pb.get("current_version_id")
-                if db is not None and vid is not None:
-                    try:
-                        version = db.get_playbook_version(vid)
-                        definition = version.get("definition") if version else None
-                        if isinstance(definition, str):
-                            definition = json.loads(definition)
-                        if isinstance(definition, dict):
-                            entry["description"] = definition.get("description", "")
-                            if detail == "compact":
-                                entry["inputs"] = sorted((definition.get("inputs") or {}).keys())
-                                entry["outputs"] = sorted((definition.get("outputs") or {}).keys())
-                            else:
-                                entry["definition"] = definition
-                            entry["estimated_duration"] = (definition.get("execution") or {}).get(
-                                "timeout", 300
-                            )
-                    except Exception:  # noqa: BLE001 — unparsable definition never blocks the catalog
-                        logger.debug(
-                            "playbook_catalog: could not parse definition for %s",
-                            entry.get("id"),
-                        )
-                playbooks.append(entry)
+                entry = _studio_catalog_entry(pb, detail, db)
+                if entry is not None:
+                    playbooks.append(entry)
             playbooks.sort(key=lambda p: p["id"])
             payload = {
                 "profile_id": profile,
@@ -964,18 +1070,45 @@ class PlaybookCatalogTool(BaseTool):
             }
             return _success_tool_result(self.name, payload)
 
-        # ── Legacy black-box path (no agent profile context) ──
-        playbooks = list_playbooks()
+        # ── No agent profile: published Studio playbooks + builtin registry ──
+        # The deployed wheel can have an empty builtin registry while the DB
+        # holds the published playbooks, so both sources are merged here.
+        builtin_playbooks = list_playbooks()
         if detail == "compact":
-            playbooks = [
+            builtin_playbooks = [
                 {
                     "id": p["id"],
                     "name": p["name"],
                     "description": p["description"],
                     "estimated_duration": p.get("estimated_duration", 300),
                 }
-                for p in playbooks
+                for p in builtin_playbooks
             ]
+
+        merged: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for p in builtin_playbooks:  # builtin ordering is preserved
+            pid = p.get("id")
+            merged[pid] = p
+            order.append(pid)
+
+        if db is not None:
+            try:
+                rows = db.list_playbooks(status="published")
+            except Exception:  # an unavailable DB must not break the catalog
+                logger.debug("playbook_catalog: could not list published playbooks", exc_info=True)
+                rows = []
+            for pb in rows:
+                entry = _studio_catalog_entry(pb, detail, db)
+                if entry is None:
+                    continue
+                pid = entry.get("id")
+                # Studio rows win on id collisions (they carry the published definition).
+                if pid not in merged:
+                    order.append(pid)
+                merged[pid] = entry
+
+        playbooks = [merged[pid] for pid in order]
         payload = {"playbooks": playbooks, "count": len(playbooks)}
         return _success_tool_result(self.name, payload)
 

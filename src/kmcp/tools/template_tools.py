@@ -10,6 +10,8 @@ playbooks with declared parameters.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from typing import Any
 
 from kmcp.models import utc_now_iso
@@ -21,6 +23,8 @@ from kmcp.tools.playbook_blackbox import (
     _run_template_defn,
     _success_tool_result,
 )
+
+logger = logging.getLogger("kmcp.tools")
 
 # ── Alias maps (AI-agent friendly: accept any common spelling) ──
 # Any of these keys resolve to the template identifier.
@@ -106,6 +110,79 @@ def _extract_params(arguments: dict[str, Any], declared: set[str] | None = None)
 # ── template_list ─────────────────────────────────────────────────────
 
 
+def _studio_template_entries(db: Any | None) -> list[dict[str, Any]]:
+    """Return published Studio playbooks that declare template parameters.
+
+    Studio stores templates as published playbook versions whose definition
+    carries a ``parameters`` block. Since the builtin template registry may be
+    empty in a deployed wheel, these are merged into ``template_list``.
+    """
+    if db is None:
+        return []
+    try:
+        rows = db.list_playbooks(status="published")
+    except Exception:
+        logger.debug("template_list: could not list published playbooks", exc_info=True)
+        return []
+
+    out: list[dict[str, Any]] = []
+    for pb in rows:
+        try:
+            vid = pb.get("current_version_id")
+            version = db.get_playbook_version(vid) if vid is not None else None
+            definition = version.get("definition") if version else None
+            if isinstance(definition, str):
+                definition = json.loads(definition)
+            if not isinstance(definition, dict):
+                continue
+            params = definition.get("parameters") or {}
+            if not isinstance(params, dict) or not params:
+                continue  # a published playbook without parameters is not a template
+            out.append(
+                {
+                    "id": pb["playbook_id"],
+                    "name": pb.get("name") or pb["playbook_id"],
+                    "description": definition.get("description") or pb.get("description") or "",
+                    "source": "studio",
+                    "parameters": {
+                        name: {
+                            "type": spec.get("type", "string"),
+                            "description": spec.get("description", ""),
+                            "required": bool(spec.get("required", False)),
+                            "default": spec.get("default"),
+                        }
+                        for name, spec in params.items()
+                        if isinstance(spec, dict)
+                    },
+                    "definition": definition,
+                }
+            )
+        except Exception:
+            logger.debug(
+                "template_list: could not parse definition for %s", pb.get("playbook_id"), exc_info=True
+            )
+    return out
+
+
+def _template_error_payload(tool_name: str, exc: BaseException) -> dict[str, Any]:
+    """Structured MCP error result for a failed ``template_run`` call."""
+    error_type = type(exc).__name__
+    message = str(exc)
+    detail = f"{error_type}: {message}" if message else error_type
+    payload = {
+        "success": False,
+        "tool": tool_name,
+        "error": detail,
+        "error_type": error_type,
+        "error_message": message,
+        "details": detail,
+    }
+    return {
+        "content": [{"type": "text", "text": json.dumps(payload, indent=2)}],
+        "isError": True,
+    }
+
+
 class TemplateListTool(BaseTool):
     """List available templates with their parameters."""
 
@@ -148,9 +225,25 @@ class TemplateListTool(BaseTool):
         return ["template_list"]
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        from kmcp.db import manager as dbm
         from kmcp.playbooks.registry import list_templates
 
         templates = list_templates()
+        # Published Studio playbooks with declared parameters are templates
+        # too; merge them with the builtin registry (Studio wins on id).
+        merged: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for t in templates:
+            tid = t.get("id")
+            merged[tid] = t
+            order.append(tid)
+        for t in _studio_template_entries(dbm.get_db()):
+            tid = t.get("id")
+            if tid not in merged:
+                order.append(tid)
+            merged[tid] = t
+        templates = [merged[tid] for tid in order]
+
         detail = arguments.get("detail", "compact")
 
         if detail == "full":
@@ -278,8 +371,26 @@ class TemplateRunTool(BaseTool):
         return ["template_run", template_id]
 
     async def execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Run a template, converting any failure into a structured error result.
+
+        The previous implementation let exceptions escape with no MCP output at
+        all (a missing/nonexistent template id or an engine failure surfaced as
+        an empty response). Errors now carry ``success=false`` plus the
+        exception type and message so agents can self-correct.
+        """
+        try:
+            return await self._execute_template(arguments)
+        except Exception as exc:
+            logger.exception("template_run failed")
+            return _template_error_payload(self.name, exc)
+
+    async def _execute_template(self, arguments: dict[str, Any]) -> dict[str, Any]:
         # Resolve template id from any accepted alias.
         template_id = _resolve_template_id(arguments)
+        if not template_id:
+            raise ValueError(
+                "template_id is required (also accepted as 'template', 'id', or 'name')"
+            )
         # Merge canonical params with flat top-level parameter keys.
         params = _extract_params(arguments, _declared_template_params(template_id))
         wants_background = bool(arguments.get("background", False))
