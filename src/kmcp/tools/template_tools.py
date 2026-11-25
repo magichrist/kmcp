@@ -16,6 +16,7 @@ from kmcp.models import utc_now_iso
 from kmcp.tools.base import BaseTool
 from kmcp.tools.playbook_blackbox import (
     JOB_REGISTRY,
+    _declared_template_params,
     _new_id,
     _run_template_defn,
     _success_tool_result,
@@ -24,6 +25,9 @@ from kmcp.tools.playbook_blackbox import (
 # ── Alias maps (AI-agent friendly: accept any common spelling) ──
 # Any of these keys resolve to the template identifier.
 _TEMPLATE_ID_KEYS = ("template_id", "template", "id", "name", "template_name")
+
+# Flat aliases accepted for the canonical `target` template parameter.
+_TARGET_INPUT_KEYS = ("target", "host", "ip", "domain", "url")
 
 # Keys that contain sensitive values and should be redacted from outputs.
 _SENSITIVE_KEYS = frozenset(
@@ -56,10 +60,12 @@ def _resolve_template_id(arguments: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_params(arguments: dict[str, Any]) -> dict[str, Any]:
+def _extract_params(arguments: dict[str, Any], declared: set[str] | None = None) -> dict[str, Any]:
     """Merge canonical ``params`` object with any flat top-level parameter keys.
 
     Every top-level key that is not an MCP-level field is treated as a template
+    parameter. Flat target aliases are MCP-level fields, so the first supplied
+    one is mapped onto ``params['target']`` when the template declares that
     parameter.
     """
     _mcp_keys = frozenset(
@@ -87,6 +93,13 @@ def _extract_params(arguments: dict[str, Any]) -> dict[str, Any]:
             continue
         if key not in params:
             params[key] = val
+
+    if params.get("target") is None and (declared is None or "target" in declared):
+        for key in _TARGET_INPUT_KEYS:
+            val = arguments.get(key)
+            if val not in (None, ""):
+                params["target"] = val
+                break
     return params
 
 
@@ -268,7 +281,7 @@ class TemplateRunTool(BaseTool):
         # Resolve template id from any accepted alias.
         template_id = _resolve_template_id(arguments)
         # Merge canonical params with flat top-level parameter keys.
-        params = _extract_params(arguments)
+        params = _extract_params(arguments, _declared_template_params(template_id))
         wants_background = bool(arguments.get("background", False))
 
         job_id = _new_id("job")
