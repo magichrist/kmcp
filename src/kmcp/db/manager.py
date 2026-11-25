@@ -11,16 +11,60 @@ migrations so existing databases are upgraded in place.
 
 from __future__ import annotations
 
+import functools
 import json
 import sqlite3
+import threading
 import uuid
 from pathlib import Path
 
 from kmcp.config import config
 
 
+def _synchronized(func):
+    """Serialize a DBManager instance method with the instance's RLock.
+
+    The manager intentionally shares one sqlite3 connection across threads
+    (``check_same_thread=False``). A connection-level ``commit()`` makes *all*
+    pending writes on that connection durable, so without a lock one thread's
+    commit can publish another thread's uncommitted writes (and its rollback
+    can no longer undo them). Holding the lock for a whole method — statements
+    plus commit — keeps each CRUD operation atomic. Re-entrant locking is
+    required because helpers such as ``get_playbook`` are called from other
+    methods (e.g. ``update_playbook``).
+    """
+
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return func(self, *args, **kwargs)
+
+    return wrapper
+
+
+def _synchronized_class(cls):
+    """Apply :func:`_synchronized` to every instance method of ``cls``.
+
+    Dunder methods are skipped (``__init__`` runs before the lock exists) as
+    are ``staticmethod``/``classmethod`` descriptors, which never touch the
+    connection. Applying this once at class definition keeps the public API
+    unchanged while covering all existing and future CRUD methods.
+    """
+    for name, value in list(vars(cls).items()):
+        if name.startswith("__"):
+            continue
+        if isinstance(value, (staticmethod, classmethod)):
+            continue
+        if callable(value):
+            setattr(cls, name, _synchronized(value))
+    return cls
+
+
+@_synchronized_class
 class DBManager:
     def __init__(self, path: Path) -> None:
+        # Must exist before any synchronized method can be called.
+        self._lock = threading.RLock()
         self.path = Path(path)
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self.conn.execute("PRAGMA foreign_keys = ON;")
@@ -719,7 +763,15 @@ class DBManager:
             """,
             (correlation_id, finding_id, observation_id, tool, confidence_contribution, now),
         )
-        cid = int(cur.lastrowid)
+        inserted_id = int(cur.lastrowid)
+        # lastrowid is connection-wide and is NOT updated when INSERT OR IGNORE
+        # skips a duplicate. Always resolve the row by its unique correlation_id
+        # so a duplicate returns the existing id, not an unrelated table's rowid.
+        row = cur.execute(
+            "SELECT id FROM finding_correlation WHERE correlation_id = ?",
+            (correlation_id,),
+        ).fetchone()
+        cid = int(row[0]) if row else inserted_id
         self.conn.commit()
         return cid
 
@@ -1040,10 +1092,18 @@ class DBManager:
         return [dict(r) for r in rows]
 
     def delete_tool_definition(self, tool_id: str) -> bool:
-        """Delete a tool definition. Returns True when a row was removed."""
+        """Delete a tool definition and its grants.
+
+        ``agent_tool_permissions`` has no FK to ``tool_definitions``; leaving
+        those rows behind would silently re-authorize a tool recreated with the
+        same ``tool_id``. Both deletes share one transaction (and the manager
+        lock), so grants cannot outlive the definition.
+        """
         cur = self.conn.cursor()
         cur.execute("DELETE FROM tool_definitions WHERE tool_id = ?", (tool_id,))
         deleted = cur.rowcount > 0
+        if deleted:
+            cur.execute("DELETE FROM agent_tool_permissions WHERE tool_id = ?", (tool_id,))
         self.conn.commit()
         return deleted
 
@@ -1480,18 +1540,53 @@ class DBManager:
         return True
 
     def delete_playbook(self, playbook_id: str) -> bool:
-        """Delete a playbook with its versions, assignments, and validations.
+        """Delete a playbook together with everything that depends on it.
 
-        Returns True when the playbook row was removed.
+        ``workflow_executions``, ``workflow_nodes`` and ``workflow_edges``
+        have foreign keys to ``playbook_versions(id)`` with no ON DELETE
+        action, so versions cannot be deleted first. Collect the version ids,
+        remove dependent rows (including execution step records), then delete
+        the versions and the playbook in the same transaction.
         """
         cur = self.conn.cursor()
         # playbook_versions rows may carry either parent key on legacy
         # databases (integer playbooks.id) or current ones (text playbook_id).
+        fk_values = self._playbook_fk_values(playbook_id)
+        fk_placeholders = ",".join("?" * len(fk_values))
+        version_rows = cur.execute(
+            f"SELECT id FROM playbook_versions WHERE playbook_id IN ({fk_placeholders})",
+            tuple(fk_values),
+        ).fetchall()
+        version_ids = [int(r[0]) for r in version_rows]
+
+        if version_ids:
+            placeholders = ",".join("?" * len(version_ids))
+            params = tuple(version_ids)
+            execution_ids = [
+                str(r[0])
+                for r in cur.execute(
+                    f"SELECT execution_id FROM workflow_executions WHERE version_id IN ({placeholders})",
+                    params,
+                ).fetchall()
+            ]
+            if execution_ids:
+                exec_placeholders = ",".join("?" * len(execution_ids))
+                cur.execute(
+                    f"DELETE FROM workflow_step_executions WHERE execution_id IN ({exec_placeholders})",
+                    tuple(execution_ids),
+                )
+            cur.execute(
+                f"DELETE FROM workflow_executions WHERE version_id IN ({placeholders})", params
+            )
+            cur.execute(f"DELETE FROM workflow_nodes WHERE version_id IN ({placeholders})", params)
+            cur.execute(f"DELETE FROM workflow_edges WHERE version_id IN ({placeholders})", params)
+            cur.execute(
+                f"DELETE FROM playbook_validations WHERE version_id IN ({placeholders})", params
+            )
+
         cur.execute(
-            "DELETE FROM playbook_versions WHERE playbook_id IN ({})".format(
-                ",".join("?" * len(self._playbook_fk_values(playbook_id)))
-            ),
-            tuple(self._playbook_fk_values(playbook_id)),
+            f"DELETE FROM playbook_versions WHERE playbook_id IN ({fk_placeholders})",
+            tuple(fk_values),
         )
         cur.execute(
             "DELETE FROM agent_playbook_assignments WHERE playbook_id = ?",
