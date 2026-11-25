@@ -69,6 +69,12 @@ INPUT_TYPES = frozenset(
 #: Input value sources allowed by the DSL.
 INPUT_SOURCES = frozenset({"agent", "operator", "static"})
 
+#: Keys of an input *declaration*. A mapping with a declared type plus one of
+#: these keys inside step ``args`` is a misplaced input spec, not a value.
+_INPUT_SPEC_KEYS = frozenset(
+    {"type", "description", "required", "source", "default", "values", "enum", "choices"}
+)
+
 #: Execution-block keys understood by the engine (bounds are enforced there).
 _EXECUTION_KEYS = frozenset({"max_parallel", "timeout", "resume", "max_iterations"})
 
@@ -554,6 +560,8 @@ def _validate_steps(
 
         if not isinstance(step.args, Mapping):
             findings.append(_finding("error", step_id, "args", "args must be a mapping"))
+        else:
+            _validate_arg_values(step, findings)
         if not isinstance(step.output_mapping, Mapping):
             findings.append(
                 _finding("error", step_id, "output_mapping", "output_mapping must be a mapping")
@@ -595,6 +603,59 @@ def _validate_steps(
         _validate_budget(step, findings)
 
     return steps
+
+
+def _validate_arg_values(step: StepDefinition, findings: list[Finding]) -> None:
+    """Reject misplaced input declarations inside step ``args``.
+
+    An agent sometimes writes ``{type: string, description: ...}`` as an arg
+    value instead of declaring the input in the playbook ``inputs`` block.
+    The engine stringifies such a dict into the tool/shell command (notably
+    nmap), so it must be a publish-time error rather than a silent bad scan.
+    Ordinary nested arg objects (e.g. ``options: {wordlist: ...}``) are left
+    alone — only input-spec-shaped fragments are flagged.
+    """
+    if not isinstance(step.args, Mapping):
+        return
+    for path, value in _walk_arg_values(step.args, "args"):
+        if not _is_input_spec_fragment(value):
+            continue
+        findings.append(
+            _finding(
+                "error",
+                step.id,
+                path,
+                "step arg looks like an input declaration fragment "
+                "({type: ..., description: ...}); declare it in the playbook "
+                "'inputs' block and reference it by name",
+            )
+        )
+
+
+def _is_input_spec_fragment(value: Any) -> bool:
+    """True for a stray ``{type: ..., description: ...}`` input-spec dict."""
+    if not isinstance(value, Mapping):
+        return False
+    declared_type = value.get("type")
+    if not isinstance(declared_type, str) or _parse_type(declared_type) is None:
+        return False
+    # A bare {"type": "tcp"} is a legitimate step arg; require a second
+    # input-declaration key before calling it a fragment.
+    return bool(set(value) & (_INPUT_SPEC_KEYS - {"type"}))
+
+
+def _walk_arg_values(value: Any, path: str) -> Iterator[tuple[str, Any]]:
+    """Yield ``(path, value)`` for every nested value of a step-arg mapping."""
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            child = f"{path}.{key}"
+            yield child, nested
+            yield from _walk_arg_values(nested, child)
+    elif isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            child = f"{path}[{index}]"
+            yield child, nested
+            yield from _walk_arg_values(nested, child)
 
 
 def _validate_step_type(
@@ -951,7 +1012,16 @@ def _validate_references(
         if isinstance(step.args, Mapping):
             for key, value in step.args.items():
                 for path, body in _walk_string_refs(value, f"args.{key}"):
-                    _check_reference(body, step.id, context, path, findings)
+                    # Args are handed straight to tools/shell commands, so an
+                    # undeclared placeholder here would execute literally.
+                    _check_reference(
+                        body,
+                        step.id,
+                        context,
+                        path,
+                        findings,
+                        require_declared_input=True,
+                    )
 
         if isinstance(step.output_mapping, Mapping):
             for key, value in step.output_mapping.items():
@@ -1055,6 +1125,7 @@ def _check_reference(
     findings: list[Finding],
     *,
     allow_bare: bool = False,
+    require_declared_input: bool = False,
 ) -> None:
     """Validate one ``{{...}}`` expression body."""
     expression = body.strip()
@@ -1093,12 +1164,15 @@ def _check_reference(
     kind = parsed[0]
     if kind == "target":
         if not {"target", "targets"} & set(context.input_specs):
+            # In step args the token would survive to the tool/shell command
+            # unrendered, so this is an error there (a style warning elsewhere).
             findings.append(
                 _finding(
-                    "warning",
+                    "error" if require_declared_input else "warning",
                     consumer,
                     field,
-                    "{{target}} is used but the playbook declares no 'target' input",
+                    "{{target}} is used but the playbook declares no 'target' input; "
+                    "it would remain unrendered at runtime",
                 )
             )
         return

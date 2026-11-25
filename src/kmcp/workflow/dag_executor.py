@@ -23,7 +23,7 @@ import copy
 import json
 import re
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -290,8 +290,10 @@ class PlaybookEngine:
                     elif step.on_failure == "skip_dependents":
                         skip_dependents_ids.add(step.id)
                 elif skipped_reason:
-                    # A false ``when`` (or a resume skip) is not a failure.
-                    mark(idx, succeeded=True)
+                    # A false ``when`` (or a resume skip) is neither a failure
+                    # nor a success — it must not inflate the completed /
+                    # succeeded buckets consumed by findings_query (F-12).
+                    mark(idx, skipped=True)
                 else:
                     mark(idx, attempted=True, succeeded=True)
 
@@ -840,24 +842,13 @@ class PlaybookEngine:
                         }
                     )
                     continue
-            # Create a per-iteration variant of the step with the item injected
-            iter_args = copy.deepcopy(step.args)
+            # Create a per-iteration variant of the step with the item injected.
+            # ``replace`` preserves *every* field — shell steps need their
+            # command/inputs/filter, and clearing ``foreach`` prevents the
+            # clone from recursing into another iteration pass.
+            iter_args = copy.deepcopy(step.args) if isinstance(step.args, dict) else {}
             iter_args["_foreach_item"] = item
-            iter_step = StepDefinition(
-                id=f"{step.id}_foreach",
-                tool=step.tool,
-                module=step.module,
-                type=step.type,
-                depends_on=step.depends_on,
-                when=step.when,
-                parallel=step.parallel,
-                output_mapping=step.output_mapping,
-                retry=step.retry,
-                on_failure=step.on_failure,
-                checkpoint=step.checkpoint,
-                budget=step.budget,
-                args=iter_args,
-            )
+            iter_step = replace(step, id=f"{step.id}_foreach", foreach=None, args=iter_args)
             try:
                 res = await self._execute_single_step(iter_step, state)
             except ScopeViolationError as e:
