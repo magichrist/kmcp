@@ -59,6 +59,16 @@ except Exception:  # pragma: no cover - optional dependency missing # noqa: BLE0
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+# Captured once so an explicit override (e.g. a different project root) can be
+# distinguished from the module's own location. After a non-editable install
+# REPO_ROOT points into site-packages, which is not where the user's .env or
+# data live — the current working directory is the project root in that case.
+_DEFAULT_REPO_ROOT = REPO_ROOT
+
+
+def _project_root() -> Path:
+    """Return the directory that holds the user's .env/data/vault files."""
+    return REPO_ROOT if REPO_ROOT != _DEFAULT_REPO_ROOT else Path.cwd()
 
 
 def _load_env() -> None:
@@ -173,6 +183,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         template = ENV_EXAMPLE_TEXT.replace("MCP_TRANSPORT=sse", "MCP_TRANSPORT=streamable-http")
         filled = _fill_template(template)
         cwd_env.write_text(filled)
+        try:
+            cwd_env.chmod(0o600)  # contains a generated MCP_API_TOKEN
+        except OSError:
+            pass
         load_dotenv(str(cwd_env), override=False)
         # Print the generated API token to the console.
         for line in filled.splitlines():
@@ -306,8 +320,13 @@ def cmd_init(args: argparse.Namespace) -> int:
       touching any user-set values. Use --force to regenerate from scratch.
     """
     _load_env()
-    env_path = REPO_ROOT / ".env"
-    example_path = REPO_ROOT / ".env.example"
+    root = _project_root()
+    explicit = getattr(args, "env_path", None)
+    # Default to the current working directory (or an explicit --path) rather
+    # than REPO_ROOT: after a non-editable install REPO_ROOT is inside
+    # site-packages, so writing there loses the token from the real project.
+    env_path = Path(explicit).expanduser() if explicit else root / ".env"
+    example_path = root / ".env.example"
 
     # Prefer the embedded template (works after pip install), fall back to the
     # on-disk .env.example when running from a source checkout.
@@ -321,7 +340,7 @@ def cmd_init(args: argparse.Namespace) -> int:
         return 1
 
     if args.force and env_path.exists():
-        backup = env_path.with_suffix(".env.bak")
+        backup = env_path.parent / f"{env_path.name}.bak"
         shutil.copy2(env_path, backup)
         env_path.unlink()
         print(f"backed up existing .env to {backup}")
@@ -336,6 +355,12 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"checked {env_path}:")
         for change in changes:
             print(f"  {change}")
+
+    # The file holds a live API token — keep it readable only by its owner.
+    try:
+        env_path.chmod(0o600)
+    except OSError:
+        pass  # best-effort on platforms/windows without POSIX mode bits
 
     print("done — run `kmcp start` now")
     return 0
@@ -379,12 +404,21 @@ def cmd_purge(args: argparse.Namespace) -> int:
                     pass
             removed.append(str(path))
 
+    # Use the same paths the server uses (config.db_path / config.artifact_dir),
+    # resolved against the project root. Hardcoding REPO_ROOT/data used to purge
+    # the wrong database after an install and report a false success.
+    from kmcp.config import config
+
+    def _resolve(path: Path) -> Path:
+        return path if path.is_absolute() else _project_root() / path
+
     if scope in ("db", "all"):
-        for name in ("kmcp.sqlite", "kmcp.sqlite-wal", "kmcp.sqlite-shm"):
-            rm(REPO_ROOT / "data" / name)
+        db_path = _resolve(Path(config.db_path))
+        for suffix in ("", "-wal", "-shm"):
+            rm(Path(f"{db_path}{suffix}"))
 
     if scope in ("vault", "all"):
-        rm(REPO_ROOT / "artifacts" / "vault")
+        rm(_resolve(Path(config.artifact_dir)) / "vault")
 
     print(f"purged: {scope}")
     if removed:
@@ -406,7 +440,9 @@ def _server_reachable(url: str, timeout: float = 1.5) -> bool:
     try:
         resp = httpx.get(url, timeout=timeout, follow_redirects=True)
         return resp.status_code < 500
-    except httpx.HTTPError:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError):
+        # InvalidURL is not an HTTPError in httpx; a URL without a port (or a
+        # malformed one) must be treated as "not reachable", not a traceback.
         return False
 
 
@@ -420,6 +456,14 @@ def _wait_for_server(urls: list[str], proc: subprocess.Popen, timeout: float = 2
             return False
         time.sleep(0.25)
     return False
+
+
+def _coerce_port(value: str | int | None, default: int = 8399) -> int:
+    """Parse a port from a CLI flag/env value, falling back on bad input."""
+    try:
+        return int(value) if value else default
+    except (TypeError, ValueError):
+        return default
 
 
 def _normalize_frontend_url(url: str) -> str:
@@ -515,17 +559,18 @@ def cmd_studio(args: argparse.Namespace) -> int:
         url = _normalize_frontend_url(url_arg)
     else:
         host_arg = getattr(args, "host", None) or os.getenv("MCP_HOST", "127.0.0.1")
-        browser_port = (
-            getattr(args, "port", None)
-            or os.getenv("STUDIO_PORT", "")
-            or os.getenv("MCP_PORT", "")
-            or "8399"
+        browser_port = _coerce_port(
+            getattr(args, "port", None) or os.getenv("STUDIO_PORT", "") or os.getenv("MCP_PORT", "")
         )
-        browser_port = int(browser_port)
         # The server binds MCP_HOST, but a 0.0.0.0 bind is not openable as a
         # browser URL. Resolve it to the LAN IP so the same link works from
         # this machine and from anywhere on the network.
         url = _browser_url_for_host(host_arg, browser_port)
+
+    # Ports to probe/serve when a URL was supplied without an explicit port.
+    fallback_port = _coerce_port(
+        getattr(args, "port", None) or os.getenv("STUDIO_PORT", "") or os.getenv("MCP_PORT", "")
+    )
 
     started_child = False
     child: subprocess.Popen | None = None
@@ -536,7 +581,12 @@ def cmd_studio(args: argparse.Namespace) -> int:
     # (and never open the browser) whenever that IP was unroutable.
     from urllib.parse import urlparse
 
-    port_in_url = urlparse(url).port
+    try:
+        # urlparse().port is None for a URL with no port and raises ValueError
+        # for a malformed one — fall back to the configured port in both cases.
+        port_in_url = urlparse(url).port or fallback_port
+    except ValueError:
+        port_in_url = fallback_port
     loopback_url = f"http://127.0.0.1:{port_in_url}/studio"
     probe_urls = [loopback_url, url] if loopback_url != url else [url]
     if any(_server_reachable(u) for u in probe_urls):
@@ -544,7 +594,7 @@ def cmd_studio(args: argparse.Namespace) -> int:
     else:
         # The child inherits STUDIO_PORT via the environment, so the server
         # binds its own MCP_PORT and serves the Studio UI on the dedicated one.
-        mcp_port = int(os.getenv("MCP_PORT", "8399"))
+        mcp_port = _coerce_port(os.getenv("MCP_PORT", ""))
         cmd = [
             sys.executable,
             "-m",
@@ -555,7 +605,13 @@ def cmd_studio(args: argparse.Namespace) -> int:
             "--port",
             str(mcp_port),
         ]
-        child = subprocess.Popen(cmd)
+        # The spawned server must serve Studio on the port we probed. Exporting
+        # STUDIO_PORT keeps `studio --port PORT` and the child's listener in sync.
+        child_env = os.environ.copy()
+        studio_port = getattr(args, "port", None) or os.getenv("STUDIO_PORT", "")
+        if studio_port:
+            child_env["STUDIO_PORT"] = str(_coerce_port(studio_port, fallback_port))
+        child = subprocess.Popen(cmd, env=child_env)
         started_child = True
         print("starting MCP server ...")
         if not _wait_for_server(probe_urls, child):
@@ -1151,6 +1207,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--force",
         action="store_true",
         help="Regenerate .env from scratch (existing .env is backed up to .env.bak)",
+    )
+    p_init.add_argument(
+        "--path",
+        dest="env_path",
+        default=None,
+        help="Where to write the .env file (default: current directory)",
     )
     p_init.set_defaults(func=cmd_init)
 
